@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "LLM Context Weaver",
+  "version": "0.1.0",
+  "description": "Weave massive context into structured knowledge with web LLMs.",
+  "permissions": ["storage", "alarms", "tabs", "scripting", "unlimitedStorage"],
+  "host_permissions": ["https://chat.deepseek.com/*"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "Open LLM Context Weaver" },
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content/deepseek.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["content/mainProbe.js"],
+      "matches": ["https://chat.deepseek.com/*"]
+    }
+  ]
+}
