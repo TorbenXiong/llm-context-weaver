@@ -51,9 +51,9 @@ export const SCROLL_AREA_SELECTORS = [
 
 /** 限流提示特征文案（toast / 页面提示），命中后引擎进入退避等待 */
 export const RATE_LIMIT_PATTERNS = [
+  /消息发送过于频繁/,
   /操作(过于|太)频繁/,
   /发送(过于|太)频繁/,
-  /请稍后再试/,
   /too many requests/i,
   /rate\s*limit/i,
   /try again later/i,

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { emptyExtraction, extractJsonBlock, mergeExtractions, sanitizeExtraction } from '../src/core/protocol/schema';
+import {
+  extractJsonBlock,
+  parseIndexResult,
+  parseJsonResult,
+  sanitizeExtraction,
+} from '../src/core/protocol/schema';
 
 describe('extractJsonBlock', () => {
   it('提取 ```json 代码块', () => {
@@ -16,39 +21,65 @@ describe('extractJsonBlock', () => {
 });
 
 describe('sanitizeExtraction', () => {
-  it('解析、类型纠正并丢弃非法条目', () => {
-    const raw =
-      '```json\n' +
-      JSON.stringify({
-        facts: [{ text: 'A' }, { text: '' }, { text: 'B', confidence: 'HIGH', time: '昨天' }, { noText: 1 }],
-        todos: [{ task: 'x', owner: 123 }],
-        unknownSection: [{ a: 1 }],
-      }) +
-      '\n```';
-    const r = sanitizeExtraction(raw);
+  it('接受面向持续维护的 knowledge 条目，并保留必要详情', () => {
+    const r = sanitizeExtraction('```json\n' + JSON.stringify({
+      knowledge: [{
+        time: '2026-09-21', category: '运维故障', topic: 'ERP连接中断',
+        content: 'ERP 客户端与服务器连接间歇性中断。',
+        details: { cause: '网络环路', solution: '拔掉其中一条网线' },
+      }],
+    }) + '\n```');
     expect(r).not.toBeNull();
-    expect(r!.version).toBe(1);
-    expect(r!.facts).toHaveLength(2);
-    expect(r!.facts[1]).toEqual({ text: 'B', time: '昨天' }); // 非法 confidence 被剔除
-    expect(r!.todos[0]).toEqual({ task: 'x', owner: '123' });
-    expect(r!.projects).toEqual([]); // 缺失字段补空数组
+    expect(r!.knowledge).toEqual([{
+      time: '2026-09-21', category: '运维故障', topic: 'ERP连接中断',
+      content: 'ERP 客户端与服务器连接间歇性中断。',
+      details: { cause: '网络环路', solution: '拔掉其中一条网线' },
+    }]);
+    expect(r!.version).toBe(2);
+  });
+
+  it('knowledge 条目缺少分类、主题或内容时触发重新生成', () => {
+    expect(sanitizeExtraction('{"knowledge":[{"topic":"缺少分类","content":"内容"}]}')).toBeNull();
+    expect(sanitizeExtraction('{"knowledge":[{"category":"事实","topic":"主题"}]}')).toBeNull();
+    expect(sanitizeExtraction('{"knowledge":[{"category":"事实","topic":"主题","content":"内容","source":"额外字段"}]}')).toBeNull();
   });
 
   it('无法解析时返回 null', () => {
     expect(sanitizeExtraction('纯文本')).toBeNull();
-    expect(sanitizeExtraction('{"facts": 不对')).toBeNull();
+    expect(sanitizeExtraction('{"knowledge": 不对')).toBeNull();
+  });
+
+  it('结构异常时返回 null，交给引擎重新生成', () => {
+    expect(sanitizeExtraction('{"knowledge":"应该是数组"}')).toBeNull();
+    expect(sanitizeExtraction('{"knowledge":[{"wrong":"缺少必填字段"}]}')).toBeNull();
+    expect(sanitizeExtraction('{"unexpected":[{"value":1}]}')).toBeNull();
+    expect(sanitizeExtraction('{"knowledge":[]}')).not.toBeNull();
+    expect(sanitizeExtraction('{"knowledge":[],"extra":true}')).toBeNull();
   });
 });
 
-describe('mergeExtractions', () => {
-  it('拼接所有分区', () => {
-    const a = emptyExtraction();
-    a.facts.push({ text: 'A' });
-    const b = emptyExtraction();
-    b.facts.push({ text: 'B' });
-    b.todos.push({ task: 'T' });
-    const m = mergeExtractions([a, b]);
-    expect(m.facts.map((f) => f.text)).toEqual(['A', 'B']);
-    expect(m.todos).toHaveLength(1);
+describe('parseJsonResult', () => {
+  it('保留模型自定义 JSON 结构，不强制清洗成固定分类', () => {
+    const raw = '```json\n{"knowledge_entries":[{"title":"ERP重启"}],"meta":{"source":"OA"}}\n```';
+    expect(parseJsonResult(raw)).toEqual({
+      knowledge_entries: [{ title: 'ERP重启' }],
+      meta: { source: 'OA' },
+    });
+  });
+
+  it('只拒绝无法解析或顶层为标量的回复', () => {
+    expect(parseJsonResult('不是 JSON')).toBeNull();
+    expect(parseJsonResult('```json\n"文本"\n```')).toBeNull();
+    expect(parseJsonResult('[{"title":"有效数组"}]')).toEqual([{ title: '有效数组' }]);
+  });
+});
+
+describe('parseIndexResult', () => {
+  it('只接受可回到原文的索引单元', () => {
+    expect(parseIndexResult('```json\n{"units":[{"id":"c1","topic":"登录","sourceHints":["2026-03-01 09:00"]}]}\n```')).toEqual({
+      units: [{ id: 'c1', topic: '登录', sourceHints: ['2026-03-01 09:00'] }],
+    });
+    expect(parseIndexResult('{"units":[{"id":"c1","topic":"登录","sourceHints":[]}]}')).toBeNull();
+    expect(parseIndexResult('{"units":[{"id":"c1","topic":"登录"}]}')).toBeNull();
   });
 });

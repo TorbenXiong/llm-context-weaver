@@ -3,7 +3,7 @@
   "name": "LLM Context Weaver",
   "version": "0.1.0",
   "description": "Weave massive context into structured knowledge with web LLMs.",
-  "permissions": ["storage", "alarms", "tabs", "scripting", "unlimitedStorage"],
+  "permissions": ["storage", "alarms", "tabs", "scripting", "unlimitedStorage", "debugger"],
   "host_permissions": ["https://chat.deepseek.com/*"],
   "background": { "service_worker": "background.js", "type": "module" },
   "action": { "default_title": "Open LLM Context Weaver" },

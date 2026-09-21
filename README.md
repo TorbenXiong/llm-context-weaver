@@ -1,39 +1,51 @@
 # LLM Context Weaver
 
-LLM Context Weaver 是一个 Manifest V3 浏览器扩展：把大型文本或聊天记录流式分块，通过网页 LLM 做结构化知识提炼，再动态执行多层归并，最终导出统一的 JSON / Markdown 知识。
-
-当前 MVP 只提供 DeepSeek Web Adapter，但核心引擎不依赖 DeepSeek、网页 DOM、URL 或 Chrome tab。
+Manifest V3 浏览器扩展：把大型文本或聊天记录分块交给网页 LLM 处理，递归归并结果，导出 JSON、Markdown 或公司 AI 助手使用的 `SKILL.md`。
 
 ## 架构
 
-- `src/core/`：Provider 无关的任务状态机、持久化编排、分块、归并与知识 schema。
-- `src/providers/deepseek/`：DeepSeek 的 tab 生命周期、DOM Adapter、选择器、提交确认与远端对账。
-- `src/background/`：MV3 事件接线和 mutation 串行化。
-- `src/ui/`：任务导入、控制、进度和结果导出。
+- `src/core/`：Provider 无关的任务状态机、持久化、分块、归并和输出协议。
+- `src/providers/deepseek/`：DeepSeek 网页 Adapter，负责标签页、DOM、提交确认、续写和会话清理。
+- `src/background/`：MV3 Service Worker 消息与告警接线。
+- `src/ui/`：任务创建、控制、进度和结果导出。
 
-核心与 Provider 之间只传递 `providerId`、不透明 `connectionId` / `remoteRef` 以及 `submit` / `inspect` 的标准结果。新增 Provider 不应修改核心引擎。
+核心层只依赖 Provider 抽象；网页 URL、DOM 选择器和限流细节只能存在于 Adapter。
 
-## 可靠性模型
+## 任务流程
 
-每个工作单元使用持久化 claim，并经历 `prepared → submitting → acknowledged`：
+默认流程为：
 
-1. 在操作网页前先保存 claim。
-2. Adapter 只有观察到输入框清空、生成开始或会话 URL 变化后，才返回 `accepted`。
-3. 提交后失联属于模糊结果：任务 fail closed，保留 claim 供恢复对账，不自动重发。
-4. 结果记录、Chunk 完成和 Job 推进在同一 IndexedDB 事务中提交。
-5. 归并计划必须减少结果数量；无法收敛时明确失败，不无限增加层数。
+1. 建立与用户目标相关的索引；
+2. 回到原文完成目标处理；
+3. 按预算递归归并，直到得到最终结果。
 
-MV3 Service Worker 可随时终止，内存只用于当前事件的串行化；可恢复状态全部在 IndexedDB 中。
+翻译、改写等线性任务可以选择直接流程，跳过索引。所有阶段都持久化状态，支持暂停、恢复、失败重试和扩展重载后继续。
 
-模糊投递时，工作台提供“再次对账”；只有用户确认网页未收到请求后，才能选择“强制重试”。后者可能重复发送，因此不会自动触发。
+知识任务使用 schema v2：
 
-## 大文件
+```json
+{
+  "knowledge": [
+    {
+      "time": "原文明确的时间（可选）",
+      "category": "分类",
+      "topic": "主题",
+      "content": "核心知识",
+      "details": { "参数或步骤": "仅必要时填写" }
+    }
+  ]
+}
+```
 
-文件导入通过 `Blob.stream()` 增量解码、分块并分批写入 IndexedDB。推荐 50MB 级输入使用文件选择器；粘贴输入仍适合较小文本。
+`category`、`topic`、`content` 是必填字段；`time` 和 `details` 按需填写。归并按主题合并重复内容，保留必要差异，不补写原文没有的信息。
+
+新建任务还可以限制测试范围：按输入百分比，或最多处理若干个原文分块。这个限制只影响知识提炼，归并不计入；多阶段流程每个分块会先索引再处理。例如设置为 3，就是先完成前 3 个分块的知识提炼，再归并这 3 个结果。
+
+## 可靠性
+
+每个工作单元按 `prepared → submitting → acknowledged` 持久化 claim。提交结果不明确时停止自动重发，等待对账；只有确认网页未收到请求后，才允许强制重试。结果、分块状态和任务状态写入 IndexedDB，Service Worker 被终止或页面刷新后可恢复。
 
 ## 开发
-
-仓库已有依赖可用时：
 
 ```bash
 npm test
@@ -41,4 +53,4 @@ npm run typecheck
 npm run build
 ```
 
-构建产物位于 `dist/`，可在 Chromium 扩展管理页通过“加载已解压的扩展程序”载入。真实网页 DOM 是外部不稳定边界，发布前仍需针对当时的 DeepSeek 页面执行人工 smoke test。
+构建产物在 `dist/`，在 Chromium 扩展管理页选择“加载已解压的扩展程序”载入。真实 DeepSeek DOM 属于外部边界，发布前应执行一次人工 smoke test。

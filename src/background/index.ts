@@ -11,6 +11,7 @@ const host: EngineHost = {
   prepare: (connectionId, unit) => provider.prepare(connectionId, unit),
   submit: (connectionId, marker, prompt) => provider.submit(connectionId, marker, prompt),
   inspect: (connectionId, unit) => provider.inspect(connectionId, unit),
+  cleanupSessions: (connectionId, sessionRefs) => provider.cleanupSessions(connectionId, sessionRefs),
   scheduleAlarm: (name, when) => { void chrome.alarms.create(name, { when }); },
   clearAlarm: (name) => { void chrome.alarms.clear(name); },
   log: (...args) => console.debug('[lcw]', ...args),
@@ -42,6 +43,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
       case 'retryFailed': return respond(() => engine.retryFailed(message.jobId), sendResponse);
       case 'forceRetryCurrent': return respond(() => engine.forceRetryCurrent(message.jobId), sendResponse);
       case 'retryChunk': return respond(() => engine.retryChunk(message.jobId, message.index), sendResponse);
+      case 'cleanupSessions': return respond(() => engine.cleanupSessions(message.jobId), sendResponse);
     }
   }
   if (isAdapterEvent(message) && sender.tab?.id != null) {
@@ -50,7 +52,10 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
       case 'ready': return respond(() => engine.onAdapterReady(connectionId), sendResponse);
       case 'generationStart': return respond(() => engine.onGenerationStart(connectionId), sendResponse);
       case 'generationEnd': return respond(() => engine.onGenerationEnd(connectionId), sendResponse);
-      case 'rateLimited': return respond(() => engine.onRateLimited(connectionId, message.detail ?? ''), sendResponse);
+      case 'rateLimited': return respond(
+        () => engine.onRateLimited(connectionId, message.detail ?? '', message.retryAfterMs),
+        sendResponse,
+      );
       case 'error': return respond(() => engine.onAdapterError(connectionId, message.detail ?? ''), sendResponse);
       case 'remoteRefChanged': return respond(() => engine.onRemoteRefChanged(connectionId, message.detail ?? ''), sendResponse);
     }

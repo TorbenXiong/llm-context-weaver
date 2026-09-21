@@ -6,8 +6,8 @@ describe('selectLastReplyText', () => {
     expect(selectLastReplyText([
       { followsMarker: false, isThinking: false, text: '旧回复' },
       { followsMarker: true, isThinking: true, text: '思考过程，不是 JSON' },
-      { followsMarker: true, isThinking: false, text: '```json\n{"facts":[]}\n```' },
-    ])).toBe('```json\n{"facts":[]}\n```');
+      { followsMarker: true, isThinking: false, text: '```json\n{"knowledge":[]}\n```' },
+    ])).toBe('```json\n{"knowledge":[]}\n```');
   });
 
   it('忽略末尾空节点', () => {

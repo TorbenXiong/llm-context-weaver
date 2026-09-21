@@ -1,81 +1,48 @@
 /**
- * 知识提炼协议（schema v1）。
+ * 知识提炼协议（统一 knowledge 条目结构）。
  * 该契约属于核心层资产：所有 Provider 的输出都必须被清洗成同一结构，
  * Adapter 只搬运文本，不自定义结果格式。
  */
-export const EXTRACTION_SCHEMA_VERSION = 1;
+export const EXTRACTION_SCHEMA_VERSION = 2;
 
-export interface FactItem { text: string; time?: string; confidence?: 'high' | 'medium' | 'low' }
-export interface ProjectItem { name: string; description?: string; status?: string }
-export interface DecisionItem { what: string; why?: string; when?: string }
-export interface SolutionItem { problem: string; solution: string }
-export interface PreferenceItem { topic: string; preference: string }
-export interface TimelineItem { time: string; event: string }
-export interface TodoItem { task: string; owner?: string; due?: string }
-export interface OpenQuestionItem { question: string; context?: string }
+/**
+ * 面向持续维护的统一知识条目。
+ * time 只在原文明确给出时填写；details 仅承载必要的参数、条件、步骤等补充信息。
+ */
+export interface KnowledgeItem {
+  time?: string;
+  category: string;
+  topic: string;
+  content: string;
+  details?: Record<string, unknown>;
+}
 
 export interface ExtractionResult {
   version: number;
-  facts: FactItem[];
-  projects: ProjectItem[];
-  decisions: DecisionItem[];
-  solutions: SolutionItem[];
-  preferences: PreferenceItem[];
-  timeline: TimelineItem[];
-  todos: TodoItem[];
-  openQuestions: OpenQuestionItem[];
+  knowledge: KnowledgeItem[];
 }
 
-const SECTION_KEYS = [
-  'facts', 'projects', 'decisions', 'solutions', 'preferences', 'timeline', 'todos', 'openQuestions',
-] as const;
-type SectionKey = (typeof SECTION_KEYS)[number];
+/** 自定义任务可保留模型自定义 JSON；知识任务使用统一 knowledge 数组。 */
+export type JsonResult = Record<string, unknown> | unknown[];
 
-const REQUIRED_FIELDS: Record<SectionKey, readonly string[]> = {
-  facts: ['text'],
-  projects: ['name'],
-  decisions: ['what'],
-  solutions: ['problem', 'solution'],
-  preferences: ['topic', 'preference'],
-  timeline: ['time', 'event'],
-  todos: ['task'],
-  openQuestions: ['question'],
-};
-
-const OPTIONAL_FIELDS: Record<SectionKey, readonly string[]> = {
-  facts: ['time', 'confidence'],
-  projects: ['description', 'status'],
-  decisions: ['why', 'when'],
-  solutions: [],
-  preferences: [],
-  timeline: [],
-  todos: ['owner', 'due'],
-  openQuestions: ['context'],
-};
-
-export function emptyExtraction(): ExtractionResult {
-  return {
-    version: EXTRACTION_SCHEMA_VERSION,
-    facts: [], projects: [], decisions: [], solutions: [],
-    preferences: [], timeline: [], todos: [], openQuestions: [],
-  };
+export interface IndexUnit {
+  id: string;
+  topic: string;
+  sourceHints: string[];
+  timeRange?: string;
 }
 
-export function mergeExtractions(list: ExtractionResult[]): ExtractionResult {
-  const out = emptyExtraction();
-  for (const r of list) {
-    for (const key of SECTION_KEYS) (out[key] as unknown[]).push(...(r[key] as unknown[]));
-  }
-  return out;
+export interface IndexResult {
+  units: IndexUnit[];
 }
 
 /** 从模型回复中提取 JSON：优先 ```json 代码块，否则做带字符串感知的平衡括号扫描 */
 export function extractJsonBlock(raw: string): string | null {
   const fence = /```(?:json)?\s*([\s\S]*?)```/i.exec(raw);
-  if (fence && fence[1] && fence[1].trim().startsWith('{')) return fence[1].trim();
-  const start = raw.indexOf('{');
+  if (fence && fence[1] && /^[\[{]/.test(fence[1].trim())) return fence[1].trim();
+  const start = raw.search(/[\[{]/);
   if (start < 0) return null;
-  let depth = 0;
+  const stack: string[] = [];
   let inStr = false;
   let esc = false;
   for (let i = start; i < raw.length; i++) {
@@ -87,13 +54,63 @@ export function extractJsonBlock(raw: string): string | null {
       continue;
     }
     if (ch === '"') inStr = true;
-    else if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return raw.slice(start, i + 1);
+    else if (ch === '{' || ch === '[') stack.push(ch);
+    else if (ch === '}' || ch === ']') {
+      const opener = stack.at(-1);
+      if ((ch === '}' && opener !== '{') || (ch === ']' && opener !== '[')) return null;
+      stack.pop();
+      if (stack.length === 0) return raw.slice(start, i + 1);
     }
   }
   return null;
+}
+
+/** 解析并原样保留模型 JSON；仅拒绝无 JSON、语法错误和顶层标量。 */
+export function parseJsonResult(raw: string): JsonResult | null {
+  const block = extractJsonBlock(raw);
+  if (!block) return null;
+  try {
+    const value: unknown = JSON.parse(block);
+    if (typeof value !== 'object' || value === null) return null;
+    return value as JsonResult;
+  } catch {
+    return null;
+  }
+}
+
+/** 索引阶段契约比最终结果严格：下一阶段必须能据此回到原文定位。 */
+export function parseIndexResult(raw: string): IndexResult | null {
+  const parsed = parseJsonResult(raw);
+  if (!parsed || Array.isArray(parsed)) return null;
+  const units = parsed['units'];
+  if (!Array.isArray(units)) return null;
+  const normalized: IndexUnit[] = [];
+  for (const value of units) {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null;
+    const item = value as Record<string, unknown>;
+    if (typeof item['id'] !== 'string' || !item['id'].trim()) return null;
+    if (typeof item['topic'] !== 'string' || !item['topic'].trim()) return null;
+    if (!Array.isArray(item['sourceHints']) || item['sourceHints'].some((hint) => typeof hint !== 'string')) return null;
+    const timeRange = typeof item['timeRange'] === 'string' && item['timeRange'].trim()
+      ? item['timeRange'].trim()
+      : undefined;
+    const sourceHints = item['sourceHints'].map((hint) => (hint as string).trim()).filter(Boolean);
+    if (sourceHints.length === 0) return null;
+    normalized.push({
+      id: item['id'].trim(),
+      topic: item['topic'].trim(),
+      sourceHints,
+      ...(timeRange ? { timeRange } : {}),
+    });
+  }
+  return { units: normalized };
+}
+
+export function isExtractionResult(value: unknown): value is ExtractionResult {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const rec = value as Record<string, unknown>;
+  return rec.version === EXTRACTION_SCHEMA_VERSION
+    && Array.isArray(rec.knowledge);
 }
 
 function asString(v: unknown): string | null {
@@ -102,10 +119,37 @@ function asString(v: unknown): string | null {
   return null;
 }
 
-/**
- * 把模型输出清洗成 schema v1：字段缺失补空数组、条目缺必填字段丢弃、
- * 非字符串标量强制转字符串、非法 confidence 剔除。解析失败返回 null。
- */
+function asDetails(v: unknown): Record<string, unknown> | null {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
+  return v as Record<string, unknown>;
+}
+
+function sanitizeKnowledgeItems(value: unknown): KnowledgeItem[] | null {
+  if (!Array.isArray(value)) return null;
+  const normalized: KnowledgeItem[] = [];
+  const allowedKeys = new Set(['time', 'category', 'topic', 'content', 'details']);
+  for (const item of value) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) return null;
+    const src = item as Record<string, unknown>;
+    if (Object.keys(src).some((key) => !allowedKeys.has(key))) return null;
+    const category = asString(src['category']);
+    const topic = asString(src['topic']);
+    const content = asString(src['content']);
+    if (!category || !topic || !content) return null;
+    const entry: KnowledgeItem = { category, topic, content };
+    const time = asString(src['time']);
+    if (time) entry.time = time;
+    if (src['details'] !== undefined) {
+      const details = asDetails(src['details']);
+      if (!details) return null;
+      entry.details = details;
+    }
+    normalized.push(entry);
+  }
+  return normalized;
+}
+
+/** 把模型输出校验并规范成统一 knowledge 契约；解析失败返回 null。 */
 export function sanitizeExtraction(raw: string): ExtractionResult | null {
   const block = extractJsonBlock(raw);
   if (!block) return null;
@@ -117,30 +161,9 @@ export function sanitizeExtraction(raw: string): ExtractionResult | null {
   }
   if (typeof data !== 'object' || data === null || Array.isArray(data)) return null;
   const rec = data as Record<string, unknown>;
-  const out = emptyExtraction();
-  for (const key of SECTION_KEYS) {
-    const arr = rec[key];
-    if (!Array.isArray(arr)) continue;
-    for (const item of arr) {
-      if (typeof item !== 'object' || item === null) continue;
-      const src = item as Record<string, unknown>;
-      const coerced: Record<string, string> = {};
-      let ok = true;
-      for (const f of REQUIRED_FIELDS[key]) {
-        const s = asString(src[f]);
-        if (s === null) { ok = false; break; }
-        coerced[f] = s;
-      }
-      if (!ok) continue;
-      for (const f of OPTIONAL_FIELDS[key]) {
-        const s = asString(src[f]);
-        if (s !== null) coerced[f] = s;
-      }
-      if (key === 'facts' && coerced['confidence'] && !['high', 'medium', 'low'].includes(coerced['confidence'])) {
-        delete coerced['confidence'];
-      }
-      (out[key] as unknown[]).push(coerced);
-    }
-  }
-  return out;
+  if (!Object.prototype.hasOwnProperty.call(rec, 'knowledge')) return null;
+  const knowledge = sanitizeKnowledgeItems(rec['knowledge']);
+  if (!knowledge) return null;
+  if (Object.keys(rec).some((key) => key !== 'version' && key !== 'knowledge')) return null;
+  return { version: EXTRACTION_SCHEMA_VERSION, knowledge };
 }

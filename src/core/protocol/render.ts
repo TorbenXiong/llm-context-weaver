@@ -1,58 +1,36 @@
 import type { ExtractionResult } from './schema';
 
-/** 把最终知识结构渲染成 Markdown 报告（本地确定性渲染，不消耗任何 LLM 请求） */
-export function renderKnowledgeMarkdown(r: ExtractionResult, title: string): string {
-  const lines: string[] = [`# ${title}`, ''];
-  if (r.facts.length > 0) {
-    lines.push('## 事实', '');
-    for (const i of r.facts) {
-      lines.push(`- ${i.text}${i.time ? `（${i.time}）` : ''}${i.confidence ? ` [${i.confidence}]` : ''}`);
+function renderKnowledgeSections(r: ExtractionResult): string {
+  const lines: string[] = [];
+  if (r.knowledge.length > 0) {
+    lines.push('## 知识条目', '');
+    for (const item of r.knowledge) {
+      const when = item.time ? `（${item.time}）` : '';
+      lines.push(`- ${when} **${item.category}｜${item.topic}**：${item.content}`.trim());
+      if (item.details && Object.keys(item.details).length > 0) {
+        lines.push(`  - 详情：${JSON.stringify(item.details, null, 2).replace(/\n/g, '\n    ')}`);
+      }
     }
-    lines.push('');
-  }
-  if (r.projects.length > 0) {
-    lines.push('## 项目', '');
-    for (const i of r.projects) {
-      lines.push(`- **${i.name}**${i.status ? `（${i.status}）` : ''}${i.description ? `：${i.description}` : ''}`);
-    }
-    lines.push('');
-  }
-  if (r.decisions.length > 0) {
-    lines.push('## 决策', '');
-    for (const i of r.decisions) {
-      lines.push(`- ${i.what}${i.why ? ` — 原因：${i.why}` : ''}${i.when ? `（${i.when}）` : ''}`);
-    }
-    lines.push('');
-  }
-  if (r.solutions.length > 0) {
-    lines.push('## 解决方案', '');
-    for (const i of r.solutions) {
-      lines.push(`- **问题**：${i.problem}`, `  **方案**：${i.solution}`);
-    }
-    lines.push('');
-  }
-  if (r.preferences.length > 0) {
-    lines.push('## 偏好', '');
-    for (const i of r.preferences) lines.push(`- ${i.topic}：${i.preference}`);
-    lines.push('');
-  }
-  if (r.timeline.length > 0) {
-    lines.push('## 时间线', '');
-    for (const i of r.timeline) lines.push(`- ${i.time} — ${i.event}`);
-    lines.push('');
-  }
-  if (r.todos.length > 0) {
-    lines.push('## 待办', '');
-    for (const i of r.todos) {
-      lines.push(`- [ ] ${i.task}${i.owner ? `（${i.owner}）` : ''}${i.due ? `，截止：${i.due}` : ''}`);
-    }
-    lines.push('');
-  }
-  if (r.openQuestions.length > 0) {
-    lines.push('## 未解决的问题', '');
-    for (const i of r.openQuestions) lines.push(`- ${i.question}${i.context ? `（${i.context}）` : ''}`);
     lines.push('');
   }
   while (lines.at(-1) === '') lines.pop();
-  return lines.join('\n') + '\n';
+  return lines.join('\n');
+}
+
+/** 把最终知识结构渲染成 Markdown 报告（本地确定性渲染，不消耗任何 LLM 请求） */
+export function renderKnowledgeMarkdown(r: ExtractionResult, title: string): string {
+  return `# ${title}\n\n${renderKnowledgeSections(r)}\n`;
+}
+
+/** 将结构化知识包装成可直接放入公司 AI 助手的 SKILL.md。 */
+export function renderSkillMarkdown(r: ExtractionResult, title: string): string {
+  const safeTitle = title.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Company Knowledge';
+  const slug = safeTitle
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64) || 'company-knowledge';
+  const description = `${safeTitle}的结构化公司知识。回答相关问题时优先依据本 Skill，证据不足时明确说明未知，不得臆造。`;
+  return `---\nname: ${slug}\ndescription: ${JSON.stringify(description)}\n---\n\n# ${safeTitle}\n\n## 使用说明\n\n你是公司内部知识助手。回答与本主题相关的问题时，优先使用下方已提炼且有原文依据的知识；不要把推测当作事实，遇到冲突或信息不足时明确说明。\n\n${renderKnowledgeSections(r)}\n`;
 }

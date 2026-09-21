@@ -1,3 +1,4 @@
+import { normalizeJobConfig } from '../config/smartDefaults';
 import type { ChunkMeta, ChunkText, Job, JobConfig, JobProgress, ResultRecord } from '../types';
 import { newId, shortId } from '../util/ids';
 import { idb, kv, openDb } from './db';
@@ -15,9 +16,11 @@ export async function createJob(name: string, config: JobConfig, providerId: str
     updatedAt: now,
     status: 'split',
     prevStatus: null,
-    config,
+    config: normalizeJobConfig(config),
     providerId,
     providerConnectionId: null,
+    providerSessionRefs: [],
+    sessionCooldownUntil: undefined,
     current: null,
     reduceState: null,
     totalChunks,
@@ -30,12 +33,23 @@ export async function createJob(name: string, config: JobConfig, providerId: str
   return job;
 }
 
-export const getJob = (jobId: string): Promise<Job | undefined> => idb.get<Job>('jobs', jobId);
+export async function getJob(jobId: string): Promise<Job | undefined> {
+  const job = await idb.get<Job>('jobs', jobId);
+  return job
+    ? { ...job, config: normalizeJobConfig(job.config), providerSessionRefs: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs : [] }
+    : undefined;
+}
 
 export const saveJob = (job: Job): Promise<IDBValidKey> => idb.put('jobs', { ...job, updatedAt: Date.now() });
 
 export const listJobs = async (): Promise<Job[]> =>
-  (await idb.getAll<Job>('jobs')).sort((a, b) => b.createdAt - a.createdAt);
+  (await idb.getAll<Job>('jobs'))
+    .map((job) => ({
+      ...job,
+      config: normalizeJobConfig(job.config),
+      providerSessionRefs: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs : [],
+    }))
+    .sort((a, b) => b.createdAt - a.createdAt);
 
 export async function deleteJob(jobId: string): Promise<void> {
   const metas = await idb.byIndex<ChunkMeta>('chunks', 'byJob', jobId);
@@ -76,7 +90,17 @@ export async function appendChunks(jobId: string, startIndex: number, texts: str
     texts.forEach((text, offset) => {
       const index = startIndex + offset;
       const id = chunkId(jobId, index);
-      const meta: ChunkMeta = { id, jobId, index, status: 'pending', attempts: 0, resultId: null, error: null };
+      const meta: ChunkMeta = {
+        id,
+        jobId,
+        index,
+        status: 'pending',
+        attempts: 0,
+        stage: 'index',
+        indexResultId: null,
+        resultId: null,
+        error: null,
+      };
       const body: ChunkText = { id, text };
       metas.put(meta);
       bodies.put(body);
@@ -98,7 +122,7 @@ export async function markUnitSubmitted(
   marker: string,
   connectionId: string,
   remoteRef: string | null | undefined,
-  kind: 'extract' | 'reduce',
+  kind: 'index' | 'extract' | 'reduce',
   index?: number,
 ): Promise<Job | undefined> {
   const db = await openDb();
@@ -112,15 +136,20 @@ export async function markUnitSubmitted(
       const job = req.result as Job | undefined;
       if (!job || !job.current || job.current.marker !== marker) return;
       const already = job.current.phase === 'acknowledged';
+      const knownSessionRefs = Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs : [];
+      const sessionRefs = remoteRef && !knownSessionRefs.includes(remoteRef)
+        ? [...knownSessionRefs, remoteRef]
+        : knownSessionRefs;
       const next: Job = {
         ...job,
         providerConnectionId: connectionId,
+        providerSessionRefs: sessionRefs,
         current: { ...job.current, phase: 'acknowledged', remoteRef: remoteRef ?? job.current.remoteRef ?? null },
         stats: already ? job.stats : { ...job.stats, sent: job.stats.sent + 1 },
         updatedAt: Date.now(),
       };
       jobs.put(next);
-      if (kind === 'extract' && index != null) {
+      if ((kind === 'index' || kind === 'extract') && index != null) {
         const metaReq = chunks.get(chunkId(jobId, index));
         metaReq.onsuccess = () => {
           const meta = metaReq.result as ChunkMeta | undefined;
@@ -131,6 +160,59 @@ export async function markUnitSubmitted(
     };
     req.onerror = () => reject(req.error);
     t.oncomplete = () => resolve(result);
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
+
+/** 索引结果、分块阶段与 Job 推进一次提交；完成后该分块回到 pending 等待目标处理。 */
+export async function commitIndexed(
+  jobId: string,
+  marker: string,
+  result: ResultRecord,
+  chunkIndex: number,
+): Promise<Job | undefined> {
+  const db = await openDb();
+  return new Promise<Job | undefined>((resolve, reject) => {
+    const t = db.transaction(['jobs', 'chunks', 'results'], 'readwrite');
+    const jobs = t.objectStore('jobs');
+    const chunks = t.objectStore('chunks');
+    const results = t.objectStore('results');
+    let output: Job | undefined;
+    const req = jobs.get(jobId);
+    req.onsuccess = () => {
+      const job = req.result as Job | undefined;
+      if (!job?.current || job.current.marker !== marker) return;
+      const resultReq = results.get(result.id);
+      resultReq.onsuccess = () => {
+        if (resultReq.result) { output = job; return; }
+        results.put(result);
+        const metaReq = chunks.get(chunkId(jobId, chunkIndex));
+        metaReq.onsuccess = () => {
+          const meta = metaReq.result as ChunkMeta | undefined;
+          if (meta) chunks.put({
+            ...meta,
+            status: 'pending',
+            attempts: 0,
+            stage: 'process',
+            indexResultId: result.id,
+            error: null,
+          });
+        };
+        output = {
+          ...job,
+          current: null,
+          status: job.status === 'paused' ? 'paused' : 'processing',
+          prevStatus: job.status === 'paused' ? 'processing' : job.prevStatus,
+          lastError: null,
+          stats: { ...job.stats, collected: job.stats.collected + 1 },
+          updatedAt: Date.now(),
+        };
+        jobs.put(output);
+      };
+    };
+    req.onerror = () => reject(req.error);
+    t.oncomplete = () => resolve(output);
     t.onerror = () => reject(t.error);
     t.onabort = () => reject(t.error);
   });
@@ -167,7 +249,7 @@ export async function commitCollected(
           const metaReq = chunks.get(chunkId(jobId, chunkIndex));
           metaReq.onsuccess = () => {
             const meta = metaReq.result as ChunkMeta | undefined;
-            if (meta) chunks.put({ ...meta, status: 'done', resultId: result.id, error: null });
+            if (meta) chunks.put({ ...meta, status: 'done', stage: 'done', resultId: result.id, error: null });
           };
         }
         output = {
@@ -247,8 +329,9 @@ export async function nextPendingChunk(jobId: string): Promise<ChunkMeta | null>
 
 export async function jobProgress(jobId: string): Promise<JobProgress> {
   const metas = await chunkMetasByJob(jobId);
-  const prog: JobProgress = { total: metas.length, pending: 0, sent: 0, done: 0, failed: 0 };
+  const prog: JobProgress = { total: metas.length, indexed: 0, pending: 0, sent: 0, done: 0, failed: 0 };
   for (const m of metas) {
+    if (m.indexResultId) prog.indexed++;
     if (m.status === 'pending') prog.pending++;
     else if (m.status === 'sent') prog.sent++;
     else if (m.status === 'done') prog.done++;

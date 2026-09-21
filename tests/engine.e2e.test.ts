@@ -14,7 +14,9 @@ class FakeProvider {
   newSessions = 0;
   submitOutcome: ProviderSubmitOutcome | null = null;
   inspection: ProviderInspection | null = null;
+  inspectionQueue: ProviderInspection[] = [];
   prepared: CurrentUnit[] = [];
+  cleanupCalls: string[][] = [];
 
   prepare(unit: CurrentUnit): void {
     this.prepared.push(unit);
@@ -27,16 +29,30 @@ class FakeProvider {
   }
 
   inspect(unit: CurrentUnit): ProviderInspection {
+    if (this.inspectionQueue.length > 0) return this.inspectionQueue.shift()!;
     if (this.inspection) return this.inspection;
     const ref = /ref=([\w.-]+)/.exec(unit.marker)?.[1] ?? 'unknown';
+    if (unit.kind === 'index') {
+      return {
+        status: 'complete',
+        remoteRef: unit.remoteRef,
+        reply: '```json\n' + JSON.stringify({
+          units: [{ id: `chunk-${ref}-1`, topic: `topic:${ref}`, sourceHints: [`source:${ref}`] }],
+        }) + '\n```',
+      };
+    }
     return {
       status: 'complete',
       remoteRef: unit.remoteRef,
       reply: '```json\n' + JSON.stringify({
-        facts: [{ text: `fact:${ref}`, confidence: 'high' }],
-        projects: [], decisions: [], solutions: [], preferences: [], timeline: [], todos: [], openQuestions: [],
+        knowledge: [{ category: '事实', topic: `topic:${ref}`, content: `fact:${ref}` }],
       }) + '\n```',
     };
+  }
+
+  cleanupSessions(refs: readonly string[]): { deletedRefs: string[]; missingRefs: string[] } {
+    this.cleanupCalls.push([...refs]);
+    return { deletedRefs: [...refs], missingRefs: [] };
   }
 }
 
@@ -60,11 +76,13 @@ async function setup(): Promise<Harness> {
     prepare: async (_connectionId, unit) => provider.prepare(unit),
     submit: async (_connectionId, _marker, prompt) => provider.submit(prompt),
     inspect: async (_connectionId, unit) => provider.inspect(unit),
+    cleanupSessions: async (_connectionId, refs) => provider.cleanupSessions(refs),
     scheduleAlarm: (name, when) => void alarms.set(name, when),
     clearAlarm: (name) => void alarms.delete(name),
     log: () => undefined,
   };
-  const config = { ...DEFAULT_JOB_CONFIG, sendDelayMs: 0, fanIn: 3 };
+  // 既有 Engine 回归测试覆盖直接流程；多阶段流程在专门用例中验证。
+  const config = { ...DEFAULT_JOB_CONFIG, pipelineMode: 'direct' as const, sendDelayMs: 0, fanIn: 3 };
   return { engine: new engineModule.Engine(host), store, provider, alarms, config };
 }
 
@@ -88,6 +106,31 @@ let h: Harness;
 beforeEach(async () => { h = await setup(); });
 
 describe('engine e2e', () => {
+  it('多阶段流程先建立索引，再把索引与原文交给目标处理，最后归并', async () => {
+    h.config = { ...h.config, pipelineMode: 'staged' };
+    const job = await makeJob(h, ['第一块原文', '第二块原文']);
+    await h.engine.startJob(job.id);
+    const done = await runToEnd(h, job.id);
+    const results = await h.store.resultsByJob(job.id);
+    expect(done.status).toBe('completed');
+    expect(results.filter((result) => result.kind === 'index')).toHaveLength(2);
+    expect(results.filter((result) => result.kind === 'extract')).toHaveLength(2);
+    expect(results.filter((result) => result.kind === 'reduce')).toHaveLength(1);
+    const indexPositions = h.provider.sentPrompts
+      .map((prompt, index) => prompt.includes('阶段：目标相关索引') ? index : -1)
+      .filter((index) => index >= 0);
+    const processPositions = h.provider.sentPrompts
+      .map((prompt, index) => prompt.includes('阶段：目标处理') ? index : -1)
+      .filter((index) => index >= 0);
+    expect(indexPositions).toHaveLength(2);
+    expect(processPositions).toHaveLength(2);
+    expect(Math.max(...indexPositions)).toBeLessThan(Math.min(...processPositions));
+    const distillPrompt = h.provider.sentPrompts.find((prompt) => prompt.includes('阶段：目标处理'))!;
+    expect(distillPrompt).toContain('相关内容索引');
+    expect(distillPrompt).toContain('topic:0');
+    expect(distillPrompt).toContain('第一块原文');
+  });
+
   it('3 块提取 + 1 次归并后完成，核心只保存不透明 Provider 引用', async () => {
     const job = await makeJob(h, ['一', '二', '三']);
     await h.engine.startJob(job.id);
@@ -98,6 +141,20 @@ describe('engine e2e', () => {
     expect(done.stats).toMatchObject({ sent: 4, collected: 4 });
     expect(h.provider.newSessions).toBe(4);
     expect((await h.store.resultsByJob(job.id))).toHaveLength(4);
+    expect(done.providerSessionRefs).toHaveLength(4);
+  });
+
+  it('清理任务对应的 Provider 网页会话时保留本地结果', async () => {
+    const job = await makeJob(h, ['only']);
+    await h.engine.startJob(job.id);
+    await runToEnd(h, job.id);
+    await h.engine.cleanupSessions(job.id);
+    const cleaned = await h.store.getJob(job.id);
+    expect(h.provider.cleanupCalls).toHaveLength(1);
+    expect(h.provider.cleanupCalls[0]).toEqual(['remote-1']);
+    expect(cleaned?.providerSessionRefs).toEqual([]);
+    expect(cleaned?.status).toBe('completed');
+    expect(await h.store.resultsByJob(job.id)).toHaveLength(1);
   });
 
   it('暂停不推进；恢复后先对账在途 claim', async () => {
@@ -107,17 +164,273 @@ describe('engine e2e', () => {
     await h.engine.onGenerationEnd(CONNECTION_ID);
     expect((await h.store.getJob(job.id))?.status).toBe('paused');
     expect((await h.store.getChunkMeta(job.id, 0))?.status).toBe('sent');
+    await h.store.setActiveJobId(null); // 模拟暂停期间扩展重载，活动任务指针丢失
     await h.engine.resume(job.id);
+    expect(await h.store.getActiveJobId()).toBe(job.id);
     expect((await h.store.getChunkMeta(job.id, 0))?.status).toBe('done');
     expect((await runToEnd(h, job.id)).status).toBe('completed');
   });
 
-  it('没有 generationEnd 时，alarm 仍可对账收单', async () => {
+  it('扩展重载时活动指针丢失，仍能从 waiting 任务恢复调度', async () => {
     const job = await makeJob(h, ['only']);
     await h.engine.startJob(job.id);
-    expect(h.alarms.has(timeoutAlarm(job.id))).toBe(true);
-    await h.engine.onAlarm(timeoutAlarm(job.id));
+    expect((await h.store.getJob(job.id))?.status).toBe('waiting');
+    await h.store.setActiveJobId(null);
+    h.alarms.clear();
+
+    await h.engine.resumeActive();
+
+    expect(await h.store.getActiveJobId()).toBe(job.id);
+    expect(h.alarms.has(resumeAlarm(job.id))).toBe(true);
+    await h.engine.onAlarm(resumeAlarm(job.id));
     expect((await h.store.getJob(job.id))?.status).toBe('completed');
+  });
+
+  it('没有 generationEnd 时，短周期主动对账仍可及时收单', async () => {
+    const job = await makeJob(h, ['only']);
+    await h.engine.startJob(job.id);
+    expect(h.alarms.has(resumeAlarm(job.id))).toBe(true);
+    expect(h.alarms.has(timeoutAlarm(job.id))).toBe(true);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect((await h.store.getJob(job.id))?.status).toBe('completed');
+  });
+
+  it('深度思考任务观察到完整回复后等待稳定窗口再收集', async () => {
+    h.config = { ...h.config, deepThinking: true };
+    const job = await makeJob(h, ['only']);
+    await h.engine.startJob(job.id);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    let waiting = await h.store.getJob(job.id);
+    expect(waiting?.status).toBe('waiting');
+    expect(waiting?.current?.completionObservedAt).toBeTypeOf('number');
+    expect(waiting?.stats.collected).toBe(0);
+
+    await h.store.saveJob({
+      ...waiting!,
+      current: { ...waiting!.current!, completionObservedAt: Date.now() - 11_000 },
+    });
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect((await h.store.getJob(job.id))?.status).toBe('completed');
+  });
+
+  it('Provider 限流后等待其建议的 30 分钟再以相同 attempt 重试', async () => {
+    const job = await makeJob(h, ['only']);
+    await h.engine.startJob(job.id);
+    const limitedAt = Date.now();
+    await h.engine.onRateLimited(CONNECTION_ID, 'DeepSeek 消息发送过于频繁', 30 * 60_000);
+    const waiting = await h.store.getJob(job.id);
+    expect(waiting?.current?.rateLimited).toBe(true);
+    expect(waiting?.stats.rateLimitHits).toBe(1);
+    expect(h.alarms.has(timeoutAlarm(job.id))).toBe(false);
+    expect(h.alarms.get(resumeAlarm(job.id))!).toBeGreaterThanOrEqual(limitedAt + 30 * 60_000);
+
+    await h.engine.onRateLimited(CONNECTION_ID, '重复限流事件', 30 * 60_000);
+    expect((await h.store.getJob(job.id))?.stats.rateLimitHits).toBe(1);
+
+    const stillLimited = await h.store.getJob(job.id);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect((await h.store.getJob(job.id))?.current?.rateLimited).toBe(true);
+    expect(h.provider.sentPrompts).toHaveLength(1);
+
+    await h.store.saveJob({
+      ...stillLimited!,
+      current: { ...stillLimited!.current!, retryAfterAt: Date.now() - 1 },
+    });
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    const retried = await h.store.getJob(job.id);
+    expect(retried?.current?.attempt).toBe(1);
+    expect(retried?.current?.rateLimited).not.toBe(true);
+    expect(h.provider.sentPrompts).toHaveLength(2);
+  });
+
+  it('每 100 个 Provider 会话后主动冷却 10 分钟，再发送下一个会话', async () => {
+    const job = await makeJob(h, ['only']);
+    const refs = Array.from({ length: 100 }, (_, index) => `remote-${index}`);
+    await h.store.saveJob({ ...job, providerSessionRefs: refs });
+    await h.engine.startJob(job.id);
+    const cooling = await h.store.getJob(job.id);
+    expect(cooling?.sessionCooldownUntil).toBeTypeOf('number');
+    expect(h.provider.sentPrompts).toHaveLength(0);
+    expect(h.alarms.get(resumeAlarm(job.id))!).toBeGreaterThanOrEqual(Date.now() + 9 * 60_000);
+
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect(h.provider.sentPrompts).toHaveLength(0);
+
+    await h.store.saveJob({ ...cooling!, sessionCooldownUntil: Date.now() - 1 });
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect(h.provider.sentPrompts).toHaveLength(1);
+  });
+
+  it('回复节点晚于生成状态挂载时，missing 只等待不误判失败', async () => {
+    const job = await makeJob(h, ['only']);
+    h.provider.inspectionQueue = [
+      { status: 'missing', detail: '回复节点尚未挂载' },
+      h.provider.inspect({
+        kind: 'extract', ref: '0', attempt: 1, marker: '[LCW test]', phase: 'acknowledged', remoteRef: 'remote-1',
+      }),
+    ];
+    await h.engine.startJob(job.id);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    const waiting = await h.store.getJob(job.id);
+    expect(waiting?.status).toBe('waiting');
+    expect(waiting?.lastError).toBeNull();
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect((await h.store.getJob(job.id))?.status).toBe('completed');
+  });
+
+  it('自定义任务保留自定义 JSON', async () => {
+    h.config = { ...h.config, taskKind: 'custom' };
+    const job = await makeJob(h, ['only']);
+    h.provider.inspectionQueue = [
+      {
+        status: 'complete',
+        remoteRef: 'remote-1',
+        reply: '```json\n{"knowledge_entries":[{"title":"正常结果"}]}\n```',
+      },
+    ];
+
+    await h.engine.startJob(job.id);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+
+    const retrying = await h.store.getJob(job.id);
+    expect(retrying?.status).toBe('completed');
+    expect(retrying?.stats).toMatchObject({ sent: 1, collected: 1 });
+    expect((await h.store.resultsByJob(job.id))[0]?.parsed).toContain('knowledge_entries');
+  });
+
+  it('知识任务拒绝缺少统一条目字段的结构并自动重试', async () => {
+    const job = await makeJob(h, ['only']);
+    h.provider.inspectionQueue = [
+      {
+        status: 'complete',
+        remoteRef: 'remote-1',
+        reply: '```json\n{"knowledge":[{"date":"2026-09-01","content":"错误结构"}]}\n```',
+      },
+      {
+        status: 'complete',
+        remoteRef: 'remote-2',
+        reply: '```json\n' + JSON.stringify({
+          knowledge: [{ category: '事实', topic: '正确事实', content: '正确事实', time: '2026-09-01' }],
+        }) + '\n```',
+      },
+    ];
+    await h.engine.startJob(job.id);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect((await h.store.getJob(job.id))?.current?.attempt).toBe(2);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    const done = await h.store.getJob(job.id);
+    expect(done?.status).toBe('completed');
+    expect((await h.store.resultsByJob(job.id))[0]?.parsed).toMatchObject({
+      knowledge: [{ category: '事实', topic: '正确事实', content: '正确事实', time: '2026-09-01' }],
+    });
+  });
+
+  it('JSON 持续无法解析时达到最大尝试次数后失败，不无限重试', async () => {
+    h.config = { ...h.config, maxAttempts: 2 };
+    const job = await makeJob(h, ['only']);
+    h.provider.inspectionQueue = [
+      { status: 'complete', remoteRef: 'remote-1', reply: '{"knowledge":' },
+      { status: 'complete', remoteRef: 'remote-2', reply: '仍然不是 JSON' },
+    ];
+
+    await h.engine.startJob(job.id);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    expect((await h.store.getJob(job.id))?.current?.attempt).toBe(2);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+
+    const failed = await h.store.getJob(job.id);
+    expect(failed?.status).toBe('failed');
+    expect(failed?.lastError).toBe('有 1 个分块失败，请重试后再归并');
+    expect(failed?.stats).toMatchObject({ sent: 2, collected: 0 });
+    expect((await h.store.getChunkMeta(job.id, 0))?.status).toBe('failed');
+  });
+
+  it('暂停状态下重试失败分块会重新排队，但不会擅自恢复任务', async () => {
+    const job = await makeJob(h, ['failed chunk', 'current chunk']);
+    await h.store.saveChunkMeta({
+      ...(await h.store.getChunkMeta(job.id, 0))!,
+      status: 'failed',
+      attempts: 3,
+      error: '旧版结构校验失败',
+    });
+    const current = {
+      kind: 'extract' as const,
+      ref: '1',
+      attempt: 1,
+      marker: `[LCW job=${job.shortId} kind=extract ref=1 attempt=1]`,
+      phase: 'acknowledged' as const,
+      remoteRef: 'remote-current',
+    };
+    await h.store.saveJob({
+      ...job,
+      status: 'paused',
+      prevStatus: 'waiting',
+      current,
+      failedChunks: [0],
+      lastError: '旧版结构校验失败',
+    });
+
+    await h.engine.retryFailed(job.id);
+
+    const queued = await h.store.getJob(job.id);
+    expect(queued?.status).toBe('paused');
+    expect(queued?.current).toEqual(current);
+    expect(queued?.failedChunks).toEqual([]);
+    expect(queued?.lastError).toBeNull();
+    expect((await h.store.getChunkMeta(job.id, 0))?.status).toBe('pending');
+  });
+
+  it('暂停且有当前单元时也可以单独重新排队失败分块', async () => {
+    const job = await makeJob(h, ['failed chunk', 'current chunk']);
+    const failedMeta = (await h.store.getChunkMeta(job.id, 0))!;
+    await h.store.saveChunkMeta({ ...failedMeta, status: 'failed', attempts: 3, error: '旧错误' });
+    await h.store.saveJob({
+      ...job,
+      status: 'paused',
+      prevStatus: 'waiting',
+      current: {
+        kind: 'extract', ref: '1', attempt: 1,
+        marker: `[LCW job=${job.shortId} kind=extract ref=1 attempt=1]`,
+        phase: 'acknowledged', remoteRef: 'remote-current',
+      },
+      failedChunks: [0],
+    });
+
+    await h.engine.retryChunk(job.id, 0);
+
+    const queued = await h.store.getJob(job.id);
+    expect(queued?.status).toBe('paused');
+    expect(queued?.current?.ref).toBe('1');
+    expect(queued?.failedChunks).toEqual([]);
+    expect((await h.store.getChunkMeta(job.id, 0))?.status).toBe('pending');
+  });
+
+  it('归并使用模型原始回复而不是插件清洗后的 parsed', async () => {
+    h.config = { ...h.config, fanIn: 2 };
+    const job = await makeJob(h, ['first', 'second']);
+    h.provider.inspectionQueue = [
+      {
+        status: 'complete',
+        remoteRef: 'remote-1',
+        reply: '原始附加说明一\n```json\n{"knowledge":[{"category":"事实","topic":"事实一","content":"事实一","details":{"sourceDetail":"必须保留一"}}]}\n```',
+      },
+      {
+        status: 'complete',
+        remoteRef: 'remote-2',
+        reply: '原始附加说明二\n```json\n{"knowledge":[{"category":"事实","topic":"事实二","content":"事实二","details":{"sourceDetail":"必须保留二"}}]}\n```',
+      },
+    ];
+
+    await h.engine.startJob(job.id);
+    await h.engine.onAlarm(resumeAlarm(job.id));
+    await h.engine.onAlarm(resumeAlarm(job.id));
+
+    expect(h.provider.sentPrompts).toHaveLength(3);
+    const reducePrompt = h.provider.sentPrompts[2]!;
+    expect(reducePrompt).toContain('原始附加说明一');
+    expect(reducePrompt).toContain('原始附加说明二');
+    expect(reducePrompt).toContain('"sourceDetail":"必须保留一"');
+    expect(reducePrompt).toContain('"sourceDetail":"必须保留二"');
   });
 
   it('prepared claim 在重启后以相同 marker 安全继续提交', async () => {
@@ -220,7 +533,7 @@ describe('engine e2e', () => {
   });
 
   it('归并预算导致每组只能容纳一项时明确失败而不是无限递归', async () => {
-    h.config = { ...h.config, reduceMaxInputChars: 1 };
+    h.config = { ...h.config, maxChunkChars: 1 };
     const job = await makeJob(h, ['a', 'b']);
     await h.engine.startJob(job.id);
     const done = await runToEnd(h, job.id);

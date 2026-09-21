@@ -8,7 +8,8 @@
  * "/a/chat/s/<id>"，通过 urlChanged 事件上报给引擎持久化。
  */
 import type { AdapterEvent } from '../../core/messaging';
-import type { DeepSeekCommand } from './messages';
+import type { DeepSeekCommand, DeepSeekContinuationResult } from './messages';
+import { DEEPSEEK_RATE_LIMIT_RETRY_MS } from './policy';
 import {
   INPUT_SELECTORS,
   MARKDOWN_SELECTORS,
@@ -29,6 +30,8 @@ const URL_WAIT_MS = 10_000;
 const ACCEPT_STABILITY_MS = 600;
 /** 兜底护栏：同一会话已堆积这么多回复时禁止继续发送（应由引擎的独立对话逻辑避免） */
 const MAX_MD_PER_CHAT = 40;
+const MAIN_PROBE_REQUEST = '__lcwReqV5';
+const MAIN_PROBE_RESPONSE = '__lcwResV5';
 
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -77,13 +80,15 @@ export class DeepSeekAdapter {
   private lastRateCheck = 0;
   private lastRateHit = 0;
   private tickRunning = false;
+  private lastContinueMarker = '';
+  private lastContinueAt = 0;
 
   private reqId = 0;
 
   constructor(private readonly emit: (e: AdapterEvent) => void) {}
 
   /** 与 MAIN world 探针桥接（content script 的 isolated world 看不到主世界渲染的 .ds-markdown） */
-  private callMainProbe<T extends Record<string, unknown>>(action: string, extra: Record<string, unknown> = {}, timeoutMs = 4_000): Promise<T> {
+  private callMainProbe<T extends object>(action: string, extra: Record<string, unknown> = {}, timeoutMs = 4_000): Promise<T> {
     return new Promise((resolve, reject) => {
       const id = ++this.reqId;
       const timer = setTimeout(() => {
@@ -91,13 +96,13 @@ export class DeepSeekAdapter {
         reject(new Error('mainProbe 无响应'));
       }, timeoutMs);
       const onMsg = (e: MessageEvent) => {
-        if (e.source !== window || !e.data || (e.data as { __lcwRes?: number }).__lcwRes !== id) return;
+        if (e.source !== window || !e.data || (e.data as Record<string, unknown>)[MAIN_PROBE_RESPONSE] !== id) return;
         clearTimeout(timer);
         window.removeEventListener('message', onMsg);
         resolve(e.data as T);
       };
       window.addEventListener('message', onMsg);
-      window.postMessage({ __lcwReq: id, action, ...extra }, '*');
+      window.postMessage({ [MAIN_PROBE_REQUEST]: id, action, ...extra }, '*');
     });
   }
 
@@ -114,7 +119,7 @@ export class DeepSeekAdapter {
   async handle(cmd: DeepSeekCommand): Promise<unknown> {
     switch (cmd.type) {
       case 'ping':
-        return { ok: true };
+        return { ok: true, url: location.href };
       case 'status': {
         if (!this.findInput()) return { state: 'unknown' };
         const gen = await this.isGenerating();
@@ -122,12 +127,18 @@ export class DeepSeekAdapter {
       }
       case 'newChat':
         return this.newChat();
+      case 'setFeatures':
+        return this.setFeatures(cmd.deepThinking, cmd.smartSearch);
       case 'hasMarker':
         return this.callMainProbe('hasMarker', { marker: cmd.marker });
       case 'sendPrompt':
         return this.sendPrompt(cmd.text);
       case 'readReply':
-        return this.readReply(cmd.marker);
+        return this.readReply(cmd.marker, cmd.expectJson);
+      case 'continueGeneration':
+        return this.continueGeneration(cmd.marker);
+      case 'deleteSessions':
+        return this.deleteSessions(cmd.sessionRefs);
       default:
         return { ok: false, error: 'unknown command' };
     }
@@ -136,6 +147,116 @@ export class DeepSeekAdapter {
   private findInput(): HTMLTextAreaElement | null {
     const el = queryFirst(INPUT_SELECTORS);
     return el instanceof HTMLTextAreaElement ? el : null;
+  }
+
+  /**
+   * 优先让 MAIN 探针处理；探针刚升级、页面从 BFCache 恢复或桥接暂时失联时，
+   * Content Script 直接点击当前会话最后一个可见按钮作为恢复兜底。
+   */
+  private async continueGeneration(marker: string): Promise<DeepSeekContinuationResult> {
+    if (this.lastContinueMarker === marker && Date.now() - this.lastContinueAt < 3_000) {
+      return {
+        found: true,
+        attempted: false,
+        confirmed: false,
+        evidence: 'not_confirmed',
+        detail: '距离上次续写尝试不足 3 秒',
+      };
+    }
+    try {
+      const result = await this.callMainProbe<DeepSeekContinuationResult>('continueGeneration', { marker }, 5_000);
+      if (result.found) {
+        this.lastContinueMarker = marker;
+        this.lastContinueAt = Date.now();
+        return result;
+      }
+    } catch {
+      // 继续走 isolated world DOM 兜底。
+    }
+    const candidates = Array.from(document.querySelectorAll<HTMLElement>('button, [role="button"]'))
+      .filter((el) => {
+        const text = (el.textContent ?? '').replace(/\s+/g, ' ').trim();
+        if (!/^(继续生成|Continue generating|Continue generation|Continue)$/i.test(text)) return false;
+        if (el.getAttribute('aria-disabled') === 'true' || el.hasAttribute('disabled')) return false;
+        if (el.classList.contains('ds-button--disabled')) return false;
+        const style = getComputedStyle(el);
+        return el.getClientRects().length > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+    });
+    const button = candidates.at(-1);
+    if (!button) return { found: false, attempted: false, confirmed: false };
+    const beforeReplyLength = queryAll(MARKDOWN_SELECTORS)
+      .reduce((total, el) => total + (el.textContent ?? '').length, 0);
+    button.scrollIntoView({ block: 'center', inline: 'center' });
+    button.focus({ preventScroll: true });
+    const rect = button.getBoundingClientRect();
+    const eventInit = {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      button: 0,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    };
+    button.dispatchEvent(new PointerEvent('pointerdown', { ...eventInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 1 }));
+    button.dispatchEvent(new MouseEvent('mousedown', { ...eventInit, view: window, buttons: 1 }));
+    button.dispatchEvent(new PointerEvent('pointerup', { ...eventInit, pointerId: 1, pointerType: 'mouse', isPrimary: true, buttons: 0 }));
+    button.dispatchEvent(new MouseEvent('mouseup', { ...eventInit, view: window, buttons: 0 }));
+    button.dispatchEvent(new MouseEvent('click', { ...eventInit, view: window, buttons: 0 }));
+    this.lastContinueMarker = marker;
+    this.lastContinueAt = Date.now();
+    const deadline = Date.now() + 4_000;
+    while (Date.now() < deadline) {
+      await wait(100);
+      if (!button.isConnected || button.offsetParent === null) {
+        return { found: true, attempted: true, confirmed: true, evidence: 'button_disappeared' };
+      }
+      if (this.isDisabled(button)) {
+        return { found: true, attempted: true, confirmed: true, evidence: 'button_disabled' };
+      }
+      if (await this.isGenerating()) {
+        return { found: true, attempted: true, confirmed: true, evidence: 'generating' };
+      }
+      const replyLength = queryAll(MARKDOWN_SELECTORS)
+        .reduce((total, el) => total + (el.textContent ?? '').length, 0);
+      if (replyLength > beforeReplyLength) {
+        return { found: true, attempted: true, confirmed: true, evidence: 'reply_grew' };
+      }
+    }
+    return {
+      found: true,
+      attempted: true,
+      confirmed: false,
+      evidence: 'not_confirmed',
+      detail: '已触发续写控件，但 4 秒内按钮、生成状态和回复内容均无变化',
+    };
+  }
+
+  /** 将任务配置映射到 DeepSeek 输入框下方的两个网页开关。 */
+  private async setFeatures(deepThinking: boolean, smartSearch: boolean): Promise<{ ok: boolean; error?: string }> {
+    const desired: Array<[string, boolean]> = [['深度思考', deepThinking], ['智能搜索', smartSearch]];
+    for (const [label, enabled] of desired) {
+      let toggle: HTMLElement | null = null;
+      for (let attempt = 0; attempt < 20 && !toggle; attempt++) {
+        toggle = this.findFeatureToggle(label);
+        if (!toggle) await wait(100);
+      }
+      if (!toggle) return { ok: false, error: `找不到 DeepSeek “${label}”开关` };
+      const current = toggle.getAttribute('aria-pressed') === 'true' || toggle.classList.contains('ds-toggle-button--selected');
+      if (current !== enabled) toggle.click();
+      await wait(100);
+      const after = toggle.getAttribute('aria-pressed') === 'true' || toggle.classList.contains('ds-toggle-button--selected');
+      if (after !== enabled) return { ok: false, error: `DeepSeek “${label}”开关未能切换到${enabled ? '开启' : '关闭'}` };
+    }
+    return { ok: true };
+  }
+
+  private findFeatureToggle(label: string): HTMLElement | null {
+    const direct = Array.from(document.querySelectorAll<HTMLElement>('[aria-pressed]'))
+      .find((el) => (el.textContent ?? '').trim().includes(label));
+    if (direct) return direct;
+    const text = Array.from(document.querySelectorAll<HTMLElement>('*'))
+      .find((el) => (el.textContent ?? '').trim() === label);
+    return text?.closest<HTMLElement>('[aria-pressed]') ?? null;
   }
 
   private isDisabled(el: HTMLElement): boolean {
@@ -189,7 +310,12 @@ export class DeepSeekAdapter {
           for (const pattern of RATE_LIMIT_PATTERNS) {
             if (pattern.test(text)) {
               this.lastRateHit = checkedAt;
-              this.emit({ channel: 'adapter', type: 'rateLimited', detail: String(pattern) });
+              this.emit({
+                channel: 'adapter',
+                type: 'rateLimited',
+                detail: 'DeepSeek 消息发送过于频繁，30 分钟后重试',
+                retryAfterMs: DEEPSEEK_RATE_LIMIT_RETRY_MS,
+              });
               break;
             }
           }
@@ -241,7 +367,7 @@ export class DeepSeekAdapter {
   }
 
   private async sendPrompt(text: string): Promise<{
-    outcome: 'accepted' | 'rejected' | 'retryable' | 'ambiguous';
+    outcome: 'accepted' | 'rejected' | 'retryable' | 'rate_limited' | 'ambiguous';
     url?: string | null;
     error?: string;
   }> {
@@ -264,6 +390,7 @@ export class DeepSeekAdapter {
         if (url) this.emit({ channel: 'adapter', type: 'remoteRefChanged', detail: url });
         if (confirmation.outcome === 'accepted') return { outcome: 'accepted', url };
         if (confirmation.outcome === 'retryable') return { outcome: 'retryable', url, error: confirmation.error };
+        if (confirmation.outcome === 'rate_limited') return { outcome: 'rate_limited', url, error: confirmation.error };
         return { outcome: 'ambiguous', url, error: '点击发送后未观察到输入框清空、生成开始或会话 URL 变化' };
       }
       await wait(100);
@@ -274,7 +401,7 @@ export class DeepSeekAdapter {
   private async waitForSubmissionConfirmation(
     originalText: string,
     timeoutMs: number,
-  ): Promise<{ outcome: 'accepted' | 'retryable' | 'ambiguous'; url: string | null; error?: string }> {
+  ): Promise<{ outcome: 'accepted' | 'retryable' | 'rate_limited' | 'ambiguous'; url: string | null; error?: string }> {
     const deadline = Date.now() + timeoutMs;
     let acceptedAt: number | null = null;
     while (Date.now() < deadline) {
@@ -282,6 +409,9 @@ export class DeepSeekAdapter {
       const bodyText = document.body?.innerText ?? '';
       if (bodyText.includes('有消息正在生成，请稍后再试')) {
         return { outcome: 'retryable', url, error: 'DeepSeek 仍有消息正在生成' };
+      }
+      if (RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(bodyText))) {
+        return { outcome: 'rate_limited', url, error: 'DeepSeek 消息发送过于频繁，30 分钟后重试' };
       }
       const input = this.findInput();
       const generating = await this.isGenerating();
@@ -298,7 +428,7 @@ export class DeepSeekAdapter {
    * 读取回复：走 MAIN world 探针（isolated world 看不到主世界渲染的回复）。
    * 找不到时让探针向上滚动触发虚拟列表加载，再重试。
    */
-  private async readReply(marker: string): Promise<{ found: boolean; text?: string; error?: string }> {
+  private async readReply(marker: string, expectJson: boolean): Promise<{ found: boolean; text?: string; error?: string }> {
     for (let round = 0; round < 5; round++) {
       try {
         const r = await this.callMainProbe<{ found?: boolean; text?: string }>('readReply', { marker });
@@ -306,7 +436,7 @@ export class DeepSeekAdapter {
           r.found === true &&
           typeof r.text === 'string' &&
           r.text.trim().length > 0 &&
-          hasCompleteJsonObject(r.text)
+          (!expectJson || hasCompleteJsonObject(r.text))
         ) {
           return { found: true, text: r.text };
         }
@@ -317,5 +447,109 @@ export class DeepSeekAdapter {
       await wait(700);
     }
     return { found: false, error: 'reply not found (main probe)' };
+  }
+
+  /**
+   * 通过 DeepSeek 侧边栏公开的“··· → 删除 → 删除该对话”流程删除会话。
+   * 不调用内部 API，避免把 Provider 私有请求格式泄露到核心层；菜单 DOM 变化时只需更新本 Adapter。
+   */
+  private async deleteSessions(sessionRefs: string[]): Promise<{
+    ok: boolean;
+    deletedRefs: string[];
+    missingRefs: string[];
+    error?: string;
+  }> {
+    const refs = [...new Set(sessionRefs.filter((ref) => /^https:\/\/chat\.deepseek\.com\/a\/chat\/s\//.test(ref)))];
+    if (refs.length === 0) return { ok: true, deletedRefs: [], missingRefs: [] };
+    if (refs.some((ref) => this.sameSession(ref, location.href))) await this.newChat();
+
+    const deletedRefs: string[] = [];
+    const missingRefs: string[] = [];
+    for (const ref of refs) {
+      const link = await this.findSessionLinkWithScroll(ref);
+      if (!link) {
+        missingRefs.push(ref);
+        continue;
+      }
+      const action = link.querySelector<HTMLElement>('[role="button"]');
+      if (!action) {
+        missingRefs.push(ref);
+        continue;
+      }
+      action.click();
+      const option = await this.waitForVisibleText('.ds-dropdown-menu-option', /^(删除|Delete)$/i);
+      if (!option) {
+        missingRefs.push(ref);
+        continue;
+      }
+      option.click();
+      const confirm = await this.waitForVisibleText('button, [role="button"]', /^(删除该对话|Delete conversation|Delete)$/i);
+      if (!confirm) {
+        missingRefs.push(ref);
+        continue;
+      }
+      confirm.click();
+      if (await this.waitForSessionGone(ref)) deletedRefs.push(ref);
+      else missingRefs.push(ref);
+    }
+    return {
+      ok: missingRefs.length === 0,
+      deletedRefs,
+      missingRefs,
+      error: missingRefs.length ? '部分会话未在当前侧边栏加载，未执行删除' : undefined,
+    };
+  }
+
+  private sameSession(left: string, right: string): boolean {
+    try { return new URL(left, location.href).pathname === new URL(right, location.href).pathname; }
+    catch { return left === right; }
+  }
+
+  private findSessionLink(ref: string): HTMLAnchorElement | null {
+    return Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href*="/a/chat/s/"]'))
+      .find((link) => this.sameSession(ref, link.href)) ?? null;
+  }
+
+  private async findSessionLinkWithScroll(ref: string): Promise<HTMLAnchorElement | null> {
+    const immediate = this.findSessionLink(ref);
+    if (immediate) return immediate;
+    const sidebar = Array.from(document.querySelectorAll<HTMLElement>('.ds-scroll-area--enabled'))
+      .find((el) => el.querySelector('a[href*="/a/chat/s/"]') && el.scrollHeight > el.clientHeight + 20);
+    if (!sidebar) return null;
+    const originalTop = sidebar.scrollTop;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      sidebar.scrollTop = Math.min(sidebar.scrollHeight, sidebar.scrollTop + Math.max(240, sidebar.clientHeight * 0.8));
+      await wait(100);
+      const found = this.findSessionLink(ref);
+      if (found) return found;
+      if (sidebar.scrollTop + sidebar.clientHeight >= sidebar.scrollHeight - 4) break;
+    }
+    sidebar.scrollTop = originalTop;
+    return null;
+  }
+
+  private findVisibleText(selector: string, pattern: RegExp): HTMLElement | null {
+    return Array.from(document.querySelectorAll<HTMLElement>(selector))
+      .filter((el) => el.offsetParent !== null)
+      .find((el) => pattern.test((el.textContent ?? '').trim())) ?? null;
+  }
+
+  private async waitForVisibleText(selector: string, pattern: RegExp, timeoutMs = 2_000): Promise<HTMLElement | null> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const found = this.findVisibleText(selector, pattern);
+      if (found) return found;
+      await wait(100);
+    }
+    return null;
+  }
+
+  private async waitForSessionGone(ref: string, timeoutMs = 3_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (!this.findSessionLink(ref)) return true;
+      await wait(150);
+    }
+    return !this.findSessionLink(ref);
   }
 }

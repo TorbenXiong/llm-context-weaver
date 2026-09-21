@@ -1,4 +1,4 @@
-import type { ChunkOptions } from './chunker';
+import { naturalBreakPosition, splitLongSegment, type ChunkOptions } from './chunker';
 
 /**
  * 从 Blob.stream() 增量解码并分块。即使输入没有换行，未处理缓冲区也受
@@ -52,8 +52,8 @@ export async function* streamBlobChunks(blob: Blob, opts: ChunkOptions): AsyncGe
       if (ready) yield ready;
       return;
     }
-    for (let offset = 0; offset < line.length; offset += hardMaxChars) {
-      const ready = appendSegment(line.slice(offset, offset + hardMaxChars));
+    for (const part of splitLongSegment(line, hardMaxChars)) {
+      const ready = appendSegment(part);
       if (ready) yield ready;
     }
   };
@@ -66,9 +66,10 @@ export async function* streamBlobChunks(blob: Blob, opts: ChunkOptions): AsyncGe
       newline = lineBuffer.indexOf('\n');
     }
     while (lineBuffer.length > hardMaxChars) {
-      const ready = appendSegment(lineBuffer.slice(0, hardMaxChars));
+      const cut = naturalBreakPosition(lineBuffer, hardMaxChars);
+      const ready = appendSegment(lineBuffer.slice(0, cut));
       if (ready) yield ready;
-      lineBuffer = lineBuffer.slice(hardMaxChars);
+      lineBuffer = lineBuffer.slice(cut).trimStart();
     }
     if (final && lineBuffer.length > 0) {
       yield* consumeLine(lineBuffer);

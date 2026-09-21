@@ -14,6 +14,7 @@ function makeJob(status: JobStatus, prevStatus: JobStatus | null = null): Job {
     config: DEFAULT_JOB_CONFIG,
     providerId: 'fake',
     providerConnectionId: null,
+    providerSessionRefs: [],
     current: null,
     reduceState: null,
     totalChunks: 1,

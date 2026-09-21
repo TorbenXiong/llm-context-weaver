@@ -34,6 +34,19 @@ describe('splitIntoChunks', () => {
     for (const c of chunks) expect(c.length).toBeLessThanOrEqual(20); // 最长行 7 字符 + 换行
   });
 
+  it('完整自然段可以略超软目标，不从段落中间切开', () => {
+    const paragraph = '第一句说明背景。第二句说明方案，第三句补充约束。';
+    const chunks = splitIntoChunks(paragraph, { maxChars: 12, hardMaxChars: 50 });
+    expect(chunks).toEqual([paragraph]);
+  });
+
+  it('超过硬上限时优先在标点处拆分', () => {
+    const text = `${'前置说明。'.repeat(8)}${'后续内容。'.repeat(8)}`;
+    const chunks = splitIntoChunks(text, { maxChars: 20, hardMaxChars: 40 });
+    expect(chunks.every((chunk) => chunk.length <= 40)).toBe(true);
+    expect(chunks.slice(0, -1).every((chunk) => /[。！？!?；;]$/.test(chunk))).toBe(true);
+  });
+
   it('统一 \\r\\n 换行符', () => {
     const chunks = splitIntoChunks('a\r\nb\r\nc', { maxChars: 100, hardMaxChars: 200 });
     expect(chunks).toEqual(['a\nb\nc']);
