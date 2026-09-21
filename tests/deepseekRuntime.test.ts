@@ -5,6 +5,7 @@ import {
   isTransientNavigationError,
   mergeContinuationResults,
   requiresSubmissionSetup,
+  shouldTryContinuationFallback,
 } from '../src/providers/deepseek/runtime';
 import type { CurrentUnit } from '../src/core/types';
 
@@ -85,5 +86,20 @@ describe('DeepSeek continuation confirmation', () => {
 
   it('没有找到按钮时返回未尝试', () => {
     expect(mergeContinuationResults([])).toEqual({ found: false, attempted: false, confirmed: false });
+  });
+
+  it('浏览器级点击找到按钮但未确认时继续尝试备用点击链路', () => {
+    expect(shouldTryContinuationFallback({
+      found: true,
+      attempted: true,
+      confirmed: false,
+      evidence: 'not_confirmed',
+    })).toBe(true);
+    expect(shouldTryContinuationFallback({
+      found: true,
+      attempted: true,
+      confirmed: true,
+      evidence: 'generating',
+    })).toBe(false);
   });
 });

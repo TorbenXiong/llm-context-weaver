@@ -127,6 +127,7 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
   const [testScope, setTestScope] = useState<TestScope>(DEFAULT_JOB_CONFIG.testScope);
   const [testPercent, setTestPercent] = useState(DEFAULT_JOB_CONFIG.testPercent);
   const [testSessionLimit, setTestSessionLimit] = useState(DEFAULT_JOB_CONFIG.testSessionLimit);
+  const [formatNormalization, setFormatNormalization] = useState(DEFAULT_JOB_CONFIG.formatNormalization);
   const [deleteProviderSessionsOnComplete, setDeleteProviderSessionsOnComplete] = useState(
     DEFAULT_JOB_CONFIG.deleteProviderSessionsOnComplete,
   );
@@ -196,6 +197,7 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
         testScope,
         testPercent: testScope === 'percent' ? Math.max(1, Math.min(100, Math.floor(testPercent || 100))) : 100,
         testSessionLimit: testScope === 'sessions' ? Math.max(1, Math.min(100_000, Math.floor(testSessionLimit || 1))) : 0,
+        formatNormalization: taskKind === 'knowledge' && formatNormalization,
       };
       if (config.taskKind === 'custom' && !config.taskInstruction) throw new Error('自定义处理模式需要填写任务要求');
       const opts = { maxChars: config.maxChunkChars, hardMaxChars: DEFAULT_JOB_CONFIG.hardMaxChunkChars };
@@ -342,6 +344,15 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
         <label className="toggle-row">
           <input type="checkbox" checked={smartSearch} onChange={(e) => setSmartSearch(e.target.checked)} />
           <span>智能搜索</span>
+        </label>
+        <label className="toggle-row">
+          <input
+            type="checkbox"
+            checked={formatNormalization}
+            disabled={taskKind !== 'knowledge'}
+            onChange={(e) => setFormatNormalization(e.target.checked)}
+          />
+          <span>统一格式归档（先生成动态规范，再分批统一）</span>
         </label>
         <label className="toggle-row warning-row">
           <input
@@ -490,6 +501,7 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
         {` · ${job.config.pipelineMode === 'staged' ? '多阶段流程' : '直接流程'}`}
         {job.config.testScope === 'percent' ? ` · 测试范围 ${job.config.testPercent}%` : ''}
         {job.config.testScope === 'sessions' ? ` · 测试最多 ${job.config.testSessionLimit} 个提炼会话` : ''}
+        {job.config.taskKind === 'knowledge' && job.config.formatNormalization ? ' · 动态格式归档' : ''}
         {job.config.taskInstruction ? ` · 要求：${job.config.taskInstruction}` : ''}
       </p>
       <div className="bar">
@@ -499,10 +511,14 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
         分块 {prog ? `${prog.done}/${prog.total}` : '…'}
         {prog && job.config.pipelineMode === 'staged' ? ` · 已建立索引 ${prog.indexed}/${prog.total}` : ''}
         {prog && prog.failed > 0 ? ` · 失败 ${prog.failed}` : ''}
+        {job.formatState?.phase === 'planning' ? ' · 正在生成动态格式规范' : ''}
+        {job.formatState?.phase === 'normalizing'
+          ? ` · 格式统一（${Math.min(job.formatState.nextGroup + 1, job.formatState.groups.length)}/${job.formatState.groups.length} 批）`
+          : ''}
         {job.reduceState
           ? ` · 归并第 ${job.reduceState.level} 层（${Math.min(job.reduceState.nextGroup + 1, job.reduceState.groups.length)}/${job.reduceState.groups.length} 组）`
           : ''}
-        {` · 已发送 ${job.stats.sent} · 已收集 ${job.stats.collected} · 限流 ${job.stats.rateLimitHits} 次`}
+        {` · 已发送总计 ${job.stats.sent} · 已收集总计 ${job.stats.collected} · 限流 ${job.stats.rateLimitHits} 次`}
         {job.providerSessionRefs.length > 0 ? ` · DeepSeek 网页会话 ${job.providerSessionRefs.length}` : ''}
         {job.sessionCooldownUntil && job.sessionCooldownUntil > Date.now()
           ? ` · 主动冷却至 ${new Date(job.sessionCooldownUntil).toLocaleTimeString()}`

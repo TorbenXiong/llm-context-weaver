@@ -64,6 +64,7 @@ describe('stateMachine', () => {
 
   it('失败 / 已完成的任务可重新打开补跑', () => {
     expect(transitionJob(makeJob('failed'), 'processing', 1).status).toBe('processing');
+    expect(transitionJob(makeJob('failed'), 'reducing', 1).status).toBe('reducing');
     expect(transitionJob(makeJob('completed'), 'processing', 1).status).toBe('processing');
   });
 });

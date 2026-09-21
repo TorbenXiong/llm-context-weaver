@@ -10,7 +10,8 @@ const TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
   paused: ['canceled'],
   completed: ['processing'], // 完成后补跑失败分块，重新归并覆盖最终结果
   canceled: [],
-  failed: ['processing', 'waiting', 'canceled'],
+  // 失败任务可能已持久化到归并/格式归档阶段，恢复时需要继续从 reducing 调度。
+  failed: ['processing', 'waiting', 'reducing', 'canceled'],
 };
 
 export const ACTIVE_STATUSES: readonly JobStatus[] = ['split', 'processing', 'waiting', 'collecting', 'reducing'];

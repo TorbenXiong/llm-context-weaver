@@ -76,5 +76,6 @@ export function normalizeJobConfig(config: Partial<JobConfig> | undefined): JobC
     taskInstruction: typeof source.taskInstruction === 'string' ? source.taskInstruction : '',
     ...testScopeConfig,
     deleteProviderSessionsOnComplete: source.deleteProviderSessionsOnComplete === true,
+    formatNormalization: source.formatNormalization !== false,
   };
 }

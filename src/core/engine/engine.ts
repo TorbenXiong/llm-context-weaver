@@ -2,11 +2,13 @@
 import {
   buildDistillationPrompt,
   buildExtractionPrompt,
+  buildFormatPlanPrompt,
+  buildNormalizePrompt,
   buildIndexPrompt,
   buildReducePrompt,
   formatMarker,
 } from '../protocol/prompts';
-import { parseIndexResult, parseJsonResult, sanitizeExtraction } from '../protocol/schema';
+import { isExtractionResult, parseFormatPlan, parseIndexResult, parseJsonResult, sanitizeExtraction } from '../protocol/schema';
 import type { ProviderHost, ProviderInspection } from '../provider';
 import { planGroups } from '../reduce/reducePlanner';
 import {
@@ -27,7 +29,7 @@ import {
   saveJob,
   setActiveJobId,
 } from '../storage/jobStore';
-import type { ChunkMeta, CurrentUnit, Job, JobStatus, ResultPayload, ResultRecord, UnitKind } from '../types';
+import type { ChunkMeta, CurrentUnit, FormatState, Job, JobStatus, ResultPayload, ResultRecord, UnitKind } from '../types';
 import { sleep } from '../util/sleep';
 import { isActive, isTerminal, transitionJob } from './stateMachine';
 
@@ -69,7 +71,7 @@ export class Engine {
     let job = await this.mustGet(jobId);
     if (job.status === 'split' || job.status === 'failed') {
       await setActiveJobId(jobId);
-      job = await this.to(job, job.current ? 'waiting' : job.reduceState ? 'reducing' : 'processing');
+      job = await this.to(job, job.current ? 'waiting' : (job.reduceState || job.formatState) ? 'reducing' : 'processing');
     } else if (!isActive(job.status)) {
       throw new Error(`任务当前状态(${job.status})不可启动`);
     } else {
@@ -83,7 +85,7 @@ export class Engine {
     let job = await getJob(jobId);
     if (!job || !isActive(job.status)) return;
     if (job.current) return this.reconcile(job, 'pump');
-    if (job.status === 'waiting') job = await this.to(job, job.reduceState ? 'reducing' : 'processing');
+    if (job.status === 'waiting') job = await this.to(job, (job.reduceState || job.formatState) ? 'reducing' : 'processing');
     if (await this.deferForSessionCooldown(job)) return;
     if (job.status === 'processing') return this.dispatchNextChunkStage(job);
     if (job.status === 'reducing') return this.dispatchNextReduce(job);
@@ -124,7 +126,7 @@ export class Engine {
     // 暂停期间 Service Worker/扩展可能被重载，activeJobId 不能只依赖旧内存周期。
     // 先重新声明活动任务，确保 Adapter ready/generation 事件和后续告警都能找到它。
     await setActiveJobId(jobId);
-    job = await this.to(job, job.prevStatus ?? (job.reduceState ? 'reducing' : 'processing'));
+    job = await this.to(job, job.prevStatus ?? (job.reduceState || job.formatState ? 'reducing' : 'processing'));
     if (job.current) await this.reconcile(job, 'resume');
     else await this.pump(job.id);
   }
@@ -145,7 +147,7 @@ export class Engine {
     const meta = await getChunkMeta(jobId, index);
     if (!job || !meta || meta.status !== 'failed') return;
     await saveChunkMeta({ ...meta, status: 'pending', attempts: 0, resultId: null, error: null });
-    job = { ...job, failedChunks: job.failedChunks.filter((value) => value !== index), reduceState: null,
+    job = { ...job, failedChunks: job.failedChunks.filter((value) => value !== index), reduceState: null, formatState: null,
       finalResultId: null, lastError: null };
     await saveJob(job);
     if (job.status === 'failed' || job.status === 'completed') job = await this.to(job, 'processing');
@@ -166,6 +168,7 @@ export class Engine {
         ...job,
         failedChunks: [],
         reduceState: null,
+        formatState: null,
         finalResultId: null,
         lastError: null,
       });
@@ -181,7 +184,7 @@ export class Engine {
       const meta = await getChunkMeta(jobId, index);
       if (meta?.status === 'failed') await saveChunkMeta({ ...meta, status: 'pending', attempts: 0, resultId: null, error: null });
     }
-    job = { ...job, failedChunks: [], reduceState: null, finalResultId: null, lastError: null };
+    job = { ...job, failedChunks: [], reduceState: null, formatState: null, finalResultId: null, lastError: null };
     await saveJob(job);
     if (job.status === 'failed' || job.status === 'completed') job = await this.to(job, 'processing');
     await setActiveJobId(job.id);
@@ -367,6 +370,35 @@ export class Engine {
   }
 
   private async dispatchNextReduce(job: Job): Promise<void> {
+    if (job.formatState) {
+      if (job.formatState.phase === 'planning') {
+        const matched = job.current?.kind === 'format' && job.current.ref === 'plan' ? job.current : null;
+        const prevAttempt = Math.max(0, (matched?.attempt ?? 0) - (matched?.rateLimited ? 1 : 0));
+        const samples = await this.loadFormatSamples(job.formatState.inputIds);
+        return this.dispatchUnit(job, { kind: 'format', ref: 'plan', prevAttempt },
+          (marker) => buildFormatPlanPrompt(marker, samples, job.config));
+      }
+      if (job.formatState.phase === 'normalizing') {
+        const state = job.formatState;
+        if (!state.planResultId) return this.failJob(job, '动态格式规范缺失');
+        if (state.nextGroup >= state.groups.length) return this.finishFormatNormalization(job);
+        const group = state.groups[state.nextGroup];
+        if (!group) return this.failJob(job, `格式统一分组缺失: ${state.nextGroup}`);
+        const plan = await getResult(state.planResultId);
+        const results = await this.loadResults(state.inputIds.slice(group.start, group.end));
+        if (!plan || results.length !== group.end - group.start) return this.failJob(job, '格式统一输入缺失');
+        const ref = `batch-${state.nextGroup}`;
+        const matched = job.current?.kind === 'normalize' && job.current.ref === ref ? job.current : null;
+        const prevAttempt = Math.max(0, (matched?.attempt ?? 0) - (matched?.rateLimited ? 1 : 0));
+        return this.dispatchUnit(job, { kind: 'normalize', ref, prevAttempt },
+          (marker) => buildNormalizePrompt(
+            marker,
+            plan.raw,
+            results.map((result) => JSON.stringify(result.parsed)),
+            job.config,
+          ));
+      }
+    }
     let state = job.reduceState;
     if (!state) return this.beginReduce(job);
     if (state.nextGroup >= state.groups.length) {
@@ -394,6 +426,49 @@ export class Engine {
     const prevAttempt = Math.max(0, (matched?.attempt ?? 0) - (matched?.rateLimited ? 1 : 0));
     return this.dispatchUnit(job, { kind: 'reduce', ref, prevAttempt },
       (marker) => buildReducePrompt(marker, results.map((r) => r.raw), job.config, state.groups.length === 1));
+  }
+
+  private async loadFormatSamples(inputIds: string[]): Promise<string[]> {
+    const results = await this.loadResults(inputIds);
+    return results.map((result) => {
+      if (isExtractionResult(result.parsed)) {
+        return JSON.stringify({
+          knowledge: result.parsed.knowledge.slice(0, 4),
+          ...(result.parsed.people ? { people: result.parsed.people.slice(0, 4) } : {}),
+        });
+      }
+      return result.raw.slice(0, 4_000);
+    });
+  }
+
+  private async finishFormatNormalization(job: Job): Promise<void> {
+    const state = job.formatState;
+    if (!state || state.outputIds.length === 0) return this.failJob(job, '格式统一未产出结果');
+    if (state.outputIds.length === 1) {
+      const next = { ...job, formatState: null, reduceState: {
+        level: 1,
+        inputIds: state.outputIds,
+        groups: [{ start: 0, end: 1 }],
+        nextGroup: 0,
+        outputIds: [],
+      } };
+      await saveJob(next);
+      return this.dispatchNextReduce(next);
+    }
+    const results = await this.loadResults(state.outputIds);
+    if (results.length !== state.outputIds.length) return this.failJob(job, '格式统一结果缺失');
+    const groups = planGroups(results.map((result) => result.raw.length), {
+      fanIn: job.config.fanIn,
+      maxChars: job.config.maxChunkChars,
+    });
+    if (groups.length >= state.outputIds.length) return this.failJob(job, '格式统一结果超过归并预算且无法收敛');
+    const next = {
+      ...job,
+      formatState: null,
+      reduceState: { level: 1, inputIds: state.outputIds, groups, nextGroup: 0, outputIds: [] },
+    };
+    await saveJob(next);
+    return this.dispatchNextReduce(next);
   }
 
   private async dispatchUnit(
@@ -499,6 +574,29 @@ export class Engine {
       if (text == null) return this.failUnit(job, `chunk ${unit.ref} 内容缺失`);
       return this.submitPrepared(job, await this.buildChunkPrompt(job, unit, meta, text), meta);
     }
+    if (unit.kind === 'format') {
+      if (!job.formatState) return this.failJob(job, '动态格式规范状态缺失');
+      return this.submitPrepared(job, buildFormatPlanPrompt(
+        unit.marker,
+        await this.loadFormatSamples(job.formatState.inputIds),
+        job.config,
+      ));
+    }
+    if (unit.kind === 'normalize') {
+      const state = job.formatState;
+      const groupIndex = Number(unit.ref.replace(/^batch-/, ''));
+      const group = state?.groups[groupIndex];
+      const plan = state?.planResultId ? await getResult(state.planResultId) : undefined;
+      if (!state || !group || !plan) return this.failJob(job, '格式统一输入缺失');
+      const results = await this.loadResults(state.inputIds.slice(group.start, group.end));
+      if (results.length !== group.end - group.start) return this.failJob(job, '格式统一分组输入缺失');
+      return this.submitPrepared(job, buildNormalizePrompt(
+        unit.marker,
+        plan.raw,
+        results.map((result) => JSON.stringify(result.parsed)),
+        job.config,
+      ));
+    }
     const state = job.reduceState;
     const group = state?.groups[state.nextGroup];
     if (!state || !group) return this.failJob(job, '归并状态缺失');
@@ -593,6 +691,24 @@ export class Engine {
       return this.dispatchUnit(job, { kind: unit.kind, ref: unit.ref, prevAttempt },
         (marker) => this.buildChunkPrompt(job, { ...unit, marker }, meta, text), meta);
     }
+    if (unit.kind === 'format') {
+      if (!job.formatState) return this.failJob(job, '动态格式规范状态缺失');
+      const samples = await this.loadFormatSamples(job.formatState.inputIds);
+      return this.dispatchUnit(job, { kind: 'format', ref: 'plan', prevAttempt },
+        (marker) => buildFormatPlanPrompt(marker, samples, job.config));
+    }
+    if (unit.kind === 'normalize') {
+      const state = job.formatState;
+      if (!state?.planResultId) return this.failJob(job, '格式统一状态缺失');
+      const groupIndex = Number(unit.ref.replace(/^batch-/, ''));
+      const group = state.groups[groupIndex];
+      const plan = await getResult(state.planResultId);
+      if (!group || !plan) return this.failJob(job, '格式统一输入缺失');
+      const results = await this.loadResults(state.inputIds.slice(group.start, group.end));
+      if (results.length !== group.end - group.start) return this.failJob(job, '格式统一分组输入缺失');
+      return this.dispatchUnit(job, { kind: 'normalize', ref: unit.ref, prevAttempt },
+        (marker) => buildNormalizePrompt(marker, plan.raw, results.map((r) => JSON.stringify(r.parsed)), job.config));
+    }
     const state = job.reduceState;
     const group = state?.groups[state.nextGroup];
     if (!state || !group) return this.failJob(job, '归并状态缺失');
@@ -615,7 +731,9 @@ export class Engine {
     if (!unit) return;
     const parsed: ResultPayload | null = unit.kind === 'index'
       ? parseIndexResult(raw)
-      : job.config.taskKind === 'custom' ? (raw.trim() || null) : sanitizeExtraction(raw);
+      : unit.kind === 'format'
+        ? parseFormatPlan(raw)
+        : job.config.taskKind === 'custom' ? (raw.trim() || null) : sanitizeExtraction(raw);
     if (!parsed) return this.resend(job, '回复结构异常，自动重新生成');
     if (unit.kind === 'index') {
       const index = Number(unit.ref);
@@ -632,6 +750,36 @@ export class Engine {
       const result: ResultRecord = { id, jobId: job.id, kind: 'extract', level: 0, ref: unit.ref,
         sourceIds: [`${job.id}:${index}`], raw, parsed, createdAt: Date.now() };
       const next = await commitCollected(job.id, unit.marker, result, 'processing', index);
+      if (next?.status !== 'paused') await this.pump(job.id);
+      return;
+    }
+    if (unit.kind === 'format') {
+      const id = `${job.id}:fplan:a${unit.attempt}`;
+      const result: ResultRecord = { id, jobId: job.id, kind: 'format', level: 0, ref: unit.ref,
+        sourceIds: job.formatState?.inputIds ?? [], raw, parsed, createdAt: Date.now() };
+      const formatState = job.formatState
+        ? { ...job.formatState, phase: 'normalizing' as const, planResultId: id, nextGroup: 0, outputIds: [] }
+        : null;
+      const next = await commitCollected(job.id, unit.marker, result, 'reducing', undefined, undefined, formatState);
+      if (next?.status !== 'paused') await this.pump(job.id);
+      return;
+    }
+    if (unit.kind === 'normalize') {
+      const state = job.formatState;
+      if (!state) return this.failJob(job, '格式统一状态缺失');
+      const groupIndex = Number(unit.ref.replace(/^batch-/, ''));
+      if (!Number.isInteger(groupIndex) || groupIndex < 0 || !state.groups[groupIndex]) {
+        return this.failJob(job, `非法格式统一引用: ${unit.ref}`);
+      }
+      const id = `${job.id}:n${groupIndex}:a${unit.attempt}`;
+      const nextFormatState: FormatState = {
+        ...state,
+        nextGroup: state.nextGroup + 1,
+        outputIds: [...state.outputIds, id],
+      };
+      const result: ResultRecord = { id, jobId: job.id, kind: 'normalize', level: 0, ref: unit.ref,
+        sourceIds: state.inputIds.slice(state.groups[groupIndex].start, state.groups[groupIndex].end), raw, parsed, createdAt: Date.now() };
+      const next = await commitCollected(job.id, unit.marker, result, 'reducing', undefined, undefined, nextFormatState);
       if (next?.status !== 'paused') await this.pump(job.id);
       return;
     }
@@ -655,6 +803,28 @@ export class Engine {
     if (ids.length === 1) return this.finalize(job, ids[0]!);
     const results = await this.loadResults(ids);
     if (results.length !== ids.length) return this.failJob(job, '提炼结果记录缺失');
+    const hasKnowledge = results.some((result) => isExtractionResult(result.parsed) && result.parsed.knowledge.length > 0);
+    if (job.config.taskKind === 'knowledge' && job.config.formatNormalization !== false && hasKnowledge) {
+      const groups = planGroups(results.map((result) => JSON.stringify(result.parsed).length), {
+        fanIn: job.config.fanIn,
+        maxChars: job.config.maxChunkChars,
+      });
+      job = {
+        ...job,
+        formatState: {
+          phase: 'planning',
+          inputIds: ids,
+          planResultId: null,
+          groups,
+          nextGroup: 0,
+          outputIds: [],
+        },
+        reduceState: null,
+      };
+      await saveJob(job);
+      job = await this.to(job, 'reducing');
+      return this.dispatchNextReduce(job);
+    }
     const groups = planGroups(results.map((result) => result.raw.length),
       { fanIn: job.config.fanIn, maxChars: job.config.maxChunkChars });
     if (groups.length >= ids.length) return this.failJob(job, '提炼结果超过归并预算且无法收敛；请提高归并预算或缩小分块');

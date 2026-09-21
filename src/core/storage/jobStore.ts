@@ -23,6 +23,7 @@ export async function createJob(name: string, config: JobConfig, providerId: str
     sessionCooldownUntil: undefined,
     current: null,
     reduceState: null,
+    formatState: null,
     totalChunks,
     failedChunks: [],
     finalResultId: null,
@@ -122,7 +123,7 @@ export async function markUnitSubmitted(
   marker: string,
   connectionId: string,
   remoteRef: string | null | undefined,
-  kind: 'index' | 'extract' | 'reduce',
+  kind: 'index' | 'extract' | 'format' | 'normalize' | 'reduce',
   index?: number,
 ): Promise<Job | undefined> {
   const db = await openDb();
@@ -226,6 +227,7 @@ export async function commitCollected(
   nextStatus: 'processing' | 'reducing',
   chunkIndex?: number,
   reduceState?: Job['reduceState'],
+  formatState?: Job['formatState'],
 ): Promise<Job | undefined> {
   const db = await openDb();
   return new Promise<Job | undefined>((resolve, reject) => {
@@ -257,7 +259,8 @@ export async function commitCollected(
           current: null,
           status: job.status === 'paused' ? 'paused' : nextStatus,
           prevStatus: job.status === 'paused' ? nextStatus : job.prevStatus,
-          reduceState: reduceState ?? job.reduceState,
+          reduceState: reduceState === undefined ? job.reduceState : reduceState,
+          formatState: formatState === undefined ? job.formatState : formatState,
           lastError: null,
           stats: { ...job.stats, collected: job.stats.collected + 1 },
           updatedAt: Date.now(),

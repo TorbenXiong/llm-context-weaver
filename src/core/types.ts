@@ -1,4 +1,4 @@
-import type { ExtractionResult, IndexResult, JsonResult } from './protocol/schema';
+import type { ExtractionResult, FormatPlan, IndexResult, JsonResult } from './protocol/schema';
 
 /** 任务级状态机状态，见 engine/stateMachine.ts */
 export type JobStatus =
@@ -12,7 +12,7 @@ export type JobStatus =
   | 'canceled'
   | 'failed';
 
-export type UnitKind = 'index' | 'extract' | 'reduce';
+export type UnitKind = 'index' | 'extract' | 'format' | 'normalize' | 'reduce';
 export type ChunkStatus = 'pending' | 'sent' | 'done' | 'failed';
 export type ChunkStage = 'index' | 'process' | 'done';
 export type DispatchPhase = 'prepared' | 'submitting' | 'acknowledged';
@@ -20,7 +20,7 @@ export type TaskKind = 'knowledge' | 'custom';
 export type PipelineMode = 'staged' | 'direct';
 /** 新建任务时可只导入一部分提炼会话，归并阶段不计入该限制。 */
 export type TestScope = 'all' | 'percent' | 'sessions';
-export type ResultPayload = ExtractionResult | IndexResult | JsonResult | string;
+export type ResultPayload = ExtractionResult | FormatPlan | IndexResult | JsonResult | string;
 
 export interface JobConfig {
   /** 多阶段先建立目标相关索引再处理原文；直接模式用于翻译、改写等线性任务。 */
@@ -51,6 +51,8 @@ export interface JobConfig {
   testScope: TestScope;
   testPercent: number;
   testSessionLimit: number;
+  /** 知识任务是否在最终归并前生成动态格式规范并分批统一结果。 */
+  formatNormalization: boolean;
 }
 
 export const DEFAULT_JOB_CONFIG: JobConfig = {
@@ -69,6 +71,7 @@ export const DEFAULT_JOB_CONFIG: JobConfig = {
   testScope: 'all',
   testPercent: 100,
   testSessionLimit: 0,
+  formatNormalization: true,
 };
 
 /** 当前在途工作单元。Provider 运行时只能把远端状态作为不透明引用返回给核心。 */
@@ -99,6 +102,15 @@ export interface ReduceGroup {
   end: number;
 }
 
+export interface FormatState {
+  phase: 'planning' | 'normalizing';
+  inputIds: string[];
+  planResultId: string | null;
+  groups: ReduceGroup[];
+  nextGroup: number;
+  outputIds: string[];
+}
+
 export interface ReduceState {
   level: number;
   inputIds: string[];
@@ -126,6 +138,8 @@ export interface Job {
   sessionCooldownUntil?: number;
   current: CurrentUnit | null;
   reduceState: ReduceState | null;
+  /** 知识归档前的动态格式规范与分批统一状态；旧任务缺失时视为 null。 */
+  formatState?: FormatState | null;
   totalChunks: number;
   failedChunks: number[];
   finalResultId: string | null;
@@ -154,7 +168,7 @@ export interface ChunkText {
 }
 
 export interface ResultRecord {
-  /** `${jobId}:c{index}:a{attempt}` 或 `${jobId}:r{level}g{group}:a{attempt}`，同 id 覆盖写保证幂等 */
+  /** `${jobId}:c{index}:a{attempt}`、`${jobId}:n{batch}:a{attempt}` 或 `${jobId}:r{level}g{group}:a{attempt}`，同 id 覆盖写保证幂等 */
   id: string;
   jobId: string;
   kind: UnitKind;

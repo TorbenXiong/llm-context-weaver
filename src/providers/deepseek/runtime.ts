@@ -159,6 +159,11 @@ export function mergeContinuationResults(
     { found: false, attempted: false, confirmed: false };
 }
 
+/** 浏览器级点击未确认时必须继续走 Adapter/Main Probe，不能提前报错。 */
+export function shouldTryContinuationFallback(result: DeepSeekContinuationResult): boolean {
+  return result.found && !result.confirmed;
+}
+
 async function clickContinueDirectly(tabId: number): Promise<DeepSeekContinuationResult> {
   const targets = await chrome.scripting.executeScript({
     target: { tabId },
@@ -389,8 +394,16 @@ export class DeepSeekProviderHost implements ProviderHost {
     };
     await ensureTabAvailable(tabId);
     // 续写不应被 Content Script 探活阻塞；页面按钮存在时直接恢复生成。
-    const directContinuation = asInspection(await clickContinueDirectly(tabId));
-    if (directContinuation) return directContinuation;
+    let directResult: DeepSeekContinuationResult = { found: false, attempted: false, confirmed: false };
+    try {
+      directResult = await clickContinueDirectly(tabId);
+    } catch {
+      // 页面导航或脚本执行短暂失败时，继续走已具备探活和重注入能力的 Adapter 链路。
+    }
+    if (!shouldTryContinuationFallback(directResult)) {
+      const directContinuation = asInspection(directResult);
+      if (directContinuation) return directContinuation;
+    }
     await waitUntilReady(tabId, unit.remoteRef ?? undefined);
     // “继续生成”是生成达到上限后的终态控件，必须优先于普通生成状态探测。
     // DeepSeek 可能同时保留一个可见但 disabled 的主按钮；若先查 status，

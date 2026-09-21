@@ -7,7 +7,7 @@ import type { JobConfig } from '../types';
 
 export interface MarkerParts {
   jobShort: string;
-  kind: 'index' | 'extract' | 'reduce';
+  kind: 'index' | 'extract' | 'format' | 'normalize' | 'reduce';
   ref: string;
   attempt: number;
 }
@@ -15,16 +15,16 @@ export interface MarkerParts {
 export type PromptOptions = Pick<JobConfig, 'taskKind' | 'taskInstruction'>;
 
 /** 面向持续维护的统一知识条目结构。保持紧凑，避免模板掩盖用户目标。 */
-export const KNOWLEDGE_JSON_TEMPLATE = `{"knowledge":[{"time":"原文明确的时间(可选)","category":"分类","topic":"主题","content":"核心知识","details":{"必要参数或步骤":"仅必要时填写，否则省略 details"}}]}`;
+export const KNOWLEDGE_JSON_TEMPLATE = `{"knowledge":[{"time":"原文明确的时间(可选)","category":"分类","topic":"主题","content":"核心知识","details":{"必要参数或步骤":"仅必要时填写，否则省略 details"},"people":["明确相关人员(可选)"]}],"people":[{"name":"明确提到的人员","role":"职责(可选)","department":"部门(可选)","responsibilities":["明确职责(可选)"]}]}`;
 
-const knowledgeFormat = `JSON代码块，key 使用英文；只输出 knowledge 数组，不要添加其他顶层 key：\n${KNOWLEDGE_JSON_TEMPLATE}`;
-const knowledgeRequirements = '精简，无需与目标无关的内容，需推算的取推算后结果；仅保留目标所需且原文明确的信息；无明确时间就省略 time；details 仅在技术参数、条件或步骤等确有必要时填写；不要输出密码、Token、Cookie、私密链接或敏感原文';
+const knowledgeFormat = `JSON代码块，key 使用英文；顶层必须有 knowledge，只有原文明确提到人员时才输出 people；不要添加其他顶层 key：\n${KNOWLEDGE_JSON_TEMPLATE}`;
+const knowledgeRequirements = '精简，无需与目标无关的内容，需推算的取推算后结果；仅保留目标所需且原文明确的信息；无明确时间就省略 time；time 若为绝对时间只保留 YYYY-MM-DD，原文只有“下周”“月底”等相对表述时原样保留；category 允许根据输入发现新分类，但同一批次中相同含义必须使用同一个简短名称，不要为了填分类而制造无关类别；topic 使用简短名词短语；content 用一至三句说明核心事实；details 仅在技术参数、条件或步骤等确有必要时填写，使用简短的键值对；people 只记录原文明确出现且与知识相关的人员，只有原文明确说明其职责、参与或被指派时才填写，不得根据发言或职位自行推断；审核状态、审核负责人和指派信息不由本任务生成；过滤密码、Token、Cookie、Session、验证码、私密链接、账号密码和可直接用于登录或充值的操作细节';
 
 export function formatMarker(p: MarkerParts): string {
   return `[LCW job=${p.jobShort} kind=${p.kind} ref=${p.ref} attempt=${p.attempt}]`;
 }
 
-export const MARKER_PATTERN = /\[LCW job=([\w-]+) kind=(index|extract|reduce) ref=([\w.-]+) attempt=(\d+)\]/;
+export const MARKER_PATTERN = /\[LCW job=([\w-]+) kind=(index|extract|format|normalize|reduce) ref=([\w.-]+) attempt=(\d+)\]/;
 
 function primaryTask(options: PromptOptions): string {
   const instruction = options.taskInstruction.trim();
@@ -123,4 +123,39 @@ ${joined}`;
 阶段约束：仅保留与目标直接相关的内容；合并重复项，保留冲突与证据；按 category + topic 合并同一主题，保留明确时间和必要详情；不得补写输入中不存在的信息
 
 ${joined}`;
+}
+
+const FORMAT_PLAN_TEMPLATE = `{"categories":[{"name":"分类名称","meaning":"分类含义","aliases":["同义旧名称"]}],"rules":{"time":"时间格式规则","topic":"主题命名规则","content":"内容保留规则","details":"详情键值规则","merge":"重复与冲突合并规则"}}`;
+
+export function buildFormatPlanPrompt(marker: string, samples: string[], options: PromptOptions): string {
+  const task = primaryTask(options);
+  return `${marker}
+阶段：动态格式规范
+目标：${task}
+格式：JSON代码块，key 使用英文；只输出格式规范，不输出知识内容
+要求：根据下方各提炼会话的样本，归纳本任务实际出现的分类、主题和字段写法；允许保留多个真实分类，不要套用固定分类表；为同义分类提供 aliases；规范必须服务于用户目标，不能添加输入样本中不存在的知识；时间、详情和合并规则要简洁明确
+结构：${FORMAT_PLAN_TEMPLATE}
+
+【各提炼会话样本】
+${samples.map((sample, index) => `【样本 ${index + 1}】\n${sample}`).join('\n\n')}`;
+}
+
+export function buildNormalizePrompt(
+  marker: string,
+  plan: string,
+  inputs: string[],
+  options: PromptOptions,
+): string {
+  const task = primaryTask(options);
+  return `${marker}
+阶段：按规范统一格式
+目标：${task}
+格式：${knowledgeFormat}
+要求：只按格式规范统一 category、topic、time、details 的写法，并合并本批次中明确重复的条目；content、人员和详情中的事实必须来自输入，不得补写、删减或改造事实；未被规范覆盖的新分类可以原样保留；无法确定是否重复时不要合并；不要输出审核或指派字段
+
+【动态格式规范】
+${plan}
+
+【待统一结果】
+${inputs.map((input, index) => `【结果 ${index + 1}】\n${input}`).join('\n\n')}`;
 }

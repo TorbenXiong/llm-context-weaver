@@ -41,6 +41,16 @@ class FakeProvider {
         }) + '\n```',
       };
     }
+    if (unit.kind === 'format') {
+      return {
+        status: 'complete',
+        remoteRef: unit.remoteRef,
+        reply: '```json\n' + JSON.stringify({
+          categories: [{ name: '统一分类', meaning: '测试知识', aliases: ['事实'] }],
+          rules: { time: 'YYYY-MM-DD', topic: '简短名词', content: '保留事实', details: '键值对', merge: '仅合并重复项' },
+        }) + '\n```',
+      };
+    }
     return {
       status: 'complete',
       remoteRef: unit.remoteRef,
@@ -82,7 +92,13 @@ async function setup(): Promise<Harness> {
     log: () => undefined,
   };
   // 既有 Engine 回归测试覆盖直接流程；多阶段流程在专门用例中验证。
-  const config = { ...DEFAULT_JOB_CONFIG, pipelineMode: 'direct' as const, sendDelayMs: 0, fanIn: 3 };
+  const config = {
+    ...DEFAULT_JOB_CONFIG,
+    pipelineMode: 'direct' as const,
+    sendDelayMs: 0,
+    fanIn: 3,
+    formatNormalization: false,
+  };
   return { engine: new engineModule.Engine(host), store, provider, alarms, config };
 }
 
@@ -106,6 +122,45 @@ let h: Harness;
 beforeEach(async () => { h = await setup(); });
 
 describe('engine e2e', () => {
+  it('知识结果先抽样生成动态格式规范，再分批统一并最终归档', async () => {
+    h.config = { ...h.config, formatNormalization: true };
+    const job = await makeJob(h, ['第一块', '第二块', '第三块']);
+    await h.engine.startJob(job.id);
+    const done = await runToEnd(h, job.id);
+    const results = await h.store.resultsByJob(job.id);
+    expect(done.status).toBe('completed');
+    expect(results.filter((result) => result.kind === 'extract')).toHaveLength(3);
+    expect(results.filter((result) => result.kind === 'format')).toHaveLength(1);
+    expect(results.filter((result) => result.kind === 'normalize')).toHaveLength(1);
+    expect(results.filter((result) => result.kind === 'reduce')).toHaveLength(1);
+    expect(done.stats).toMatchObject({ sent: 6, collected: 6 });
+    const stages = h.provider.sentPrompts.map((prompt) =>
+      ['目标处理', '动态格式规范', '按规范统一格式', '最终交付'].find((stage) => prompt.includes(`阶段：${stage}`)) ?? 'extract');
+    expect(stages.slice(-3)).toEqual(['动态格式规范', '按规范统一格式', '最终交付']);
+    const planPrompt = h.provider.sentPrompts.find((prompt) => prompt.includes('阶段：动态格式规范'))!;
+    expect(planPrompt).toContain('topic:0');
+    expect(planPrompt).toContain('topic:1');
+    expect(planPrompt).toContain('topic:2');
+    const normalizePrompt = h.provider.sentPrompts.find((prompt) => prompt.includes('阶段：按规范统一格式'))!;
+    expect(normalizePrompt).toContain('aliases');
+    expect(normalizePrompt).toContain('统一分类');
+  });
+
+  it('格式规范阶段暂停后可从持久化状态恢复', async () => {
+    h.config = { ...h.config, formatNormalization: true };
+    const job = await makeJob(h, ['第一块', '第二块']);
+    await h.engine.startJob(job.id);
+    await h.engine.onGenerationEnd(CONNECTION_ID);
+    await h.engine.onGenerationEnd(CONNECTION_ID);
+    const planning = await h.store.getJob(job.id);
+    expect(planning?.formatState?.phase).toBe('planning');
+    await h.engine.pause(job.id);
+    await h.engine.resume(job.id);
+    const done = await runToEnd(h, job.id);
+    expect(done.status).toBe('completed');
+    expect(done.formatState).toBeNull();
+  });
+
   it('多阶段流程先建立索引，再把索引与原文交给目标处理，最后归并', async () => {
     h.config = { ...h.config, pipelineMode: 'staged' };
     const job = await makeJob(h, ['第一块原文', '第二块原文']);
