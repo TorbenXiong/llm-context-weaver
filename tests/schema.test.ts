@@ -4,6 +4,7 @@ import {
   parseFormatPlan,
   parseIndexResult,
   parseJsonResult,
+  sanitizeJsonResult,
   sanitizeExtraction,
 } from '../src/core/protocol/schema';
 
@@ -159,5 +160,37 @@ describe('parseFormatPlan', () => {
   it('缺少分类样本或规则时拒绝，触发重新生成', () => {
     expect(parseFormatPlan('{"categories":[],"rules":{"time":"YYYY-MM-DD"}}')).toBeNull();
     expect(parseFormatPlan('{"categories":[{"name":"流程"}],"rules":{}}')).toBeNull();
+  });
+
+  it('保留动态输出形态，用于后续阶段选择任务专属 JSON', () => {
+    expect(parseFormatPlan(JSON.stringify({
+      categories: [{ name: '成长模式' }],
+      rules: { content: '保留原文依据' },
+      output: {
+        mode: 'json',
+        topLevelKey: 'profiles',
+        itemFields: ['pattern', 'evidence'],
+        description: '按人物模式归档',
+      },
+    }))).toMatchObject({
+      output: {
+        mode: 'json',
+        topLevelKey: 'profiles',
+        itemFields: ['pattern', 'evidence'],
+      },
+    });
+  });
+});
+
+describe('sanitizeJsonResult', () => {
+  it('过滤通用 JSON 中的凭证字段和敏感句子，但保留其他结构', () => {
+    expect(sanitizeJsonResult({
+      profile: '负责系统维护',
+      password: 'secret',
+      evidence: ['完成迁移。密码是 secret。', '持续复盘'],
+    })).toEqual({
+      profile: '负责系统维护',
+      evidence: ['完成迁移。', '持续复盘'],
+    });
   });
 });

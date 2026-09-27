@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  isDeepSeekHome,
+  isDeepSeekRemoteSessionMissingError,
   isReadyPingReply,
   isSameRemoteSession,
   isTransientNavigationError,
+  hasRepeatedReplyTail,
   mergeContinuationResults,
   requiresSubmissionSetup,
   shouldTryContinuationFallback,
@@ -56,9 +59,27 @@ describe('DeepSeek Provider preparation', () => {
     expect(requiresSubmissionSetup(unit('submitting'))).toBe(false);
     expect(requiresSubmissionSetup(unit('acknowledged'))).toBe(false);
   });
+
+  it('可以识别被删除后重定向到首页的会话', () => {
+    expect(isDeepSeekHome('https://chat.deepseek.com/')).toBe(true);
+    expect(isDeepSeekHome('https://chat.deepseek.com/a/chat/s/session-id')).toBe(false);
+    expect(isDeepSeekRemoteSessionMissingError({ code: 'remote_session_missing' })).toBe(true);
+  });
 });
 
 describe('DeepSeek continuation confirmation', () => {
+  it('只识别回复尾部连续重复，短重复片段不触发', () => {
+    const repeated = '说明OA账号同步；说明OA密码修改；'.repeat(12);
+    expect(hasRepeatedReplyTail(`正常内容。${repeated}`)).toBe(true);
+    expect(hasRepeatedReplyTail('说明OA账号同步；说明OA密码修改；'.repeat(2))).toBe(false);
+    expect(shouldTryContinuationFallback({
+      found: true,
+      attempted: false,
+      confirmed: false,
+      evidence: 'repeated_tail',
+    })).toBe(false);
+  });
+
   it('只把页面已发生变化的续写尝试视为成功', () => {
     expect(mergeContinuationResults([
       { found: true, attempted: true, confirmed: false, evidence: 'not_confirmed' },

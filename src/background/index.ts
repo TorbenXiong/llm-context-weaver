@@ -11,6 +11,7 @@ const host: EngineHost = {
   prepare: (connectionId, unit) => provider.prepare(connectionId, unit),
   submit: (connectionId, marker, prompt) => provider.submit(connectionId, marker, prompt),
   inspect: (connectionId, unit) => provider.inspect(connectionId, unit),
+  getDispatchCooldown: (job, inputChars, now) => provider.getDispatchCooldown(job, inputChars, now),
   cleanupSessions: (connectionId, sessionRefs) => provider.cleanupSessions(connectionId, sessionRefs),
   scheduleAlarm: (name, when) => { void chrome.alarms.create(name, { when }); },
   clearAlarm: (name) => { void chrome.alarms.clear(name); },
@@ -42,7 +43,9 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
       case 'cancel': return respond(() => engine.cancel(message.jobId), sendResponse);
       case 'retryFailed': return respond(() => engine.retryFailed(message.jobId), sendResponse);
       case 'forceRetryCurrent': return respond(() => engine.forceRetryCurrent(message.jobId), sendResponse);
+      case 'manualContinue': return respond(() => engine.manualContinue(message.jobId), sendResponse);
       case 'retryChunk': return respond(() => engine.retryChunk(message.jobId, message.index), sendResponse);
+      case 'reprocessResults': return respond(() => engine.reprocessResults(message.jobId, message.resultIds), sendResponse);
       case 'cleanupSessions': return respond(() => engine.cleanupSessions(message.jobId), sendResponse);
     }
   }
@@ -53,7 +56,7 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
       case 'generationStart': return respond(() => engine.onGenerationStart(connectionId), sendResponse);
       case 'generationEnd': return respond(() => engine.onGenerationEnd(connectionId), sendResponse);
       case 'rateLimited': return respond(
-        () => engine.onRateLimited(connectionId, message.detail ?? '', message.retryAfterMs),
+        () => engine.onRateLimited(connectionId, message.detail ?? '', message.retryAfterMs, message.continuationRetryAfterMs),
         sendResponse,
       );
       case 'error': return respond(() => engine.onAdapterError(connectionId, message.detail ?? ''), sendResponse);

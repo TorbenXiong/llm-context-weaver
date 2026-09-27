@@ -1,7 +1,7 @@
-import type { ProviderCleanupResult, ProviderHost, ProviderInspection, ProviderSubmitOutcome } from '../../core/provider';
+import type { ProviderCleanupResult, ProviderHost, ProviderInspection, ProviderPrepareOutcome, ProviderSubmitOutcome } from '../../core/provider';
 import type { CurrentUnit, Job } from '../../core/types';
 import type { DeepSeekCommand, DeepSeekContinuationResult } from './messages';
-import { DEEPSEEK_RATE_LIMIT_RETRY_MS } from './policy';
+import { DEEPSEEK_CONTINUATION_PROBE_MS, DEEPSEEK_RATE_LIMIT_RETRY_MS, getDeepSeekDispatchCooldown } from './policy';
 
 const HOME = 'https://chat.deepseek.com/';
 const URL_PATTERN = 'https://chat.deepseek.com/*';
@@ -23,6 +23,23 @@ export function isSameRemoteSession(left: string | undefined, right: string): bo
   }
 }
 
+export function isDeepSeekHome(url: string | undefined): boolean {
+  return !!url && isSameRemoteSession(url, HOME);
+}
+
+class DeepSeekRemoteSessionMissingError extends Error {
+  readonly code = 'remote_session_missing';
+
+  constructor() {
+    super('DeepSeek 目标会话不存在，可能已被删除');
+  }
+}
+
+export function isDeepSeekRemoteSessionMissingError(error: unknown): boolean {
+  return error instanceof DeepSeekRemoteSessionMissingError ||
+    (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'remote_session_missing');
+}
+
 const tabIdOf = (connectionId: string): number => {
   const tabId = Number(connectionId);
   if (!Number.isInteger(tabId)) throw new Error(`非法 DeepSeek connectionId: ${connectionId}`);
@@ -32,6 +49,21 @@ const tabIdOf = (connectionId: string): number => {
 export function isTransientNavigationError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /back\/forward cache|message channel is closed|receiving end does not exist/i.test(message);
+}
+
+/**
+ * DeepSeek 续写异常时，回复尾部可能把同一段 JSON/文本重复追加多次。
+ * 只判定尾部连续重复，避免正常正文中偶然重复词句触发重试。
+ */
+export function hasRepeatedReplyTail(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const maxPartLength = Math.min(256, Math.floor(normalized.length / 3));
+  for (let partLength = 12; partLength <= maxPartLength; partLength++) {
+    if (partLength * 3 < 120) continue;
+    const part = normalized.slice(-partLength);
+    if (normalized.slice(-partLength * 3) === part.repeat(3)) return true;
+  }
+  return false;
 }
 
 interface DeepSeekPingReply {
@@ -112,6 +144,10 @@ async function waitUntilReady(tabId: number, expectedUrl?: string): Promise<void
 async function waitUntilAtSession(tabId: number, remoteRef: string): Promise<void> {
   for (let attempt = 0; attempt < 120; attempt++) {
     const tab = await chrome.tabs.get(tabId);
+    // 先让 tabs.update 的导航落地一次，避免把导航前原本就在首页误判为已删除。
+    if (attempt > 0 && tab.status === 'complete' && isDeepSeekHome(tab.url)) {
+      throw new DeepSeekRemoteSessionMissingError();
+    }
     if (isSameRemoteSession(tab.url, remoteRef) && tab.status === 'complete') {
       // complete 后再让出一个事件循环，避免刚进入 BFCache 的旧 content script 抢答。
       await wait(250);
@@ -161,14 +197,14 @@ export function mergeContinuationResults(
 
 /** 浏览器级点击未确认时必须继续走 Adapter/Main Probe，不能提前报错。 */
 export function shouldTryContinuationFallback(result: DeepSeekContinuationResult): boolean {
-  return result.found && !result.confirmed;
+  return result.found && !result.confirmed && result.evidence !== 'repeated_tail';
 }
 
 async function clickContinueDirectly(tabId: number): Promise<DeepSeekContinuationResult> {
   const targets = await chrome.scripting.executeScript({
     target: { tabId },
     world: 'MAIN',
-    func: (): { found: boolean; x?: number; y?: number; replyLength?: number } => {
+    func: (): { found: boolean; x?: number; y?: number; replyLength?: number; repeatedTail?: boolean } => {
       const isDisabled = (el: HTMLElement): boolean =>
         el.getAttribute('aria-disabled') === 'true' ||
         el.hasAttribute('disabled') ||
@@ -194,6 +230,18 @@ async function clickContinueDirectly(tabId: number): Promise<DeepSeekContinuatio
       const replies = document.querySelectorAll<HTMLElement>(
         '.ds-markdown, .ds-assistant-message-main-content, [class*="markdown-body"]',
       );
+      const replyText = Array.from(replies).map((el) => el.textContent ?? '').join('\n').replace(/\s+/g, ' ').trim();
+      const maxPartLength = Math.min(256, Math.floor(replyText.length / 3));
+      let repeatedTail = false;
+      for (let partLength = 12; partLength <= maxPartLength; partLength++) {
+        if (partLength * 3 < 120) continue;
+        const part = replyText.slice(-partLength);
+        if (replyText.slice(-partLength * 3) === part.repeat(3)) {
+          repeatedTail = true;
+          break;
+        }
+      }
+      if (repeatedTail) return { found: true, repeatedTail: true, replyLength: replyText.length };
       return {
         found: true,
         x: rect.left + rect.width / 2,
@@ -203,6 +251,15 @@ async function clickContinueDirectly(tabId: number): Promise<DeepSeekContinuatio
     },
   });
   const target = targets.find((result) => result.result?.found)?.result;
+  if (target?.repeatedTail) {
+    return {
+      found: true,
+      attempted: false,
+      confirmed: false,
+      evidence: 'repeated_tail',
+      detail: '检测到回复尾部连续重复，停止继续生成并重新创建会话重试',
+    };
+  }
   if (!target?.found || target.x == null || target.y == null) {
     return { found: false, attempted: false, confirmed: false };
   }
@@ -302,6 +359,10 @@ async function clickContinueDirectly(tabId: number): Promise<DeepSeekContinuatio
 }
 
 export class DeepSeekProviderHost implements ProviderHost {
+  getDispatchCooldown(job: Job, inputChars: number, now: number) {
+    return getDeepSeekDispatchCooldown(job, inputChars, now);
+  }
+
   async connect(job: Job): Promise<string> {
     // legacy 是 v1 原型数据的迁移标记；当时唯一 Provider 就是 DeepSeek。
     if (job.providerId !== 'deepseek' && job.providerId !== 'legacy') {
@@ -326,13 +387,25 @@ export class DeepSeekProviderHost implements ProviderHost {
     return String(tabId);
   }
 
-  async prepare(connectionId: string, unit: CurrentUnit): Promise<void> {
+  async prepare(connectionId: string, unit: CurrentUnit): Promise<ProviderPrepareOutcome | void> {
     const tabId = tabIdOf(connectionId);
     const readyTab = await ensureTabAvailable(tabId);
     if (unit.remoteRef) {
       if (!isSameRemoteSession(readyTab.url, unit.remoteRef)) {
         await chrome.tabs.update(tabId, { url: unit.remoteRef });
-        await waitUntilAtSession(tabId, unit.remoteRef);
+        try {
+          await waitUntilAtSession(tabId, unit.remoteRef);
+        } catch (error) {
+          if (unit.phase === 'acknowledged' && isDeepSeekRemoteSessionMissingError(error)) {
+            // 旧会话已被用户删除；让核心递增 attempt，在新会话中重发当前单元。
+            await waitUntilReady(tabId);
+            return {
+              status: 'retry_current',
+              detail: 'DeepSeek 原网页会话已被删除，已准备创建新会话重试当前单元',
+            };
+          }
+          throw error;
+        }
       }
       if (requiresSubmissionSetup(unit)) {
         await waitUntilReady(tabId, unit.remoteRef);
@@ -373,8 +446,9 @@ export class DeepSeekProviderHost implements ProviderHost {
     if (reply?.outcome === 'rate_limited') {
       return {
         status: 'rate_limited',
-        detail: reply.error ?? 'DeepSeek 消息发送过于频繁，30 分钟后重试',
+        detail: reply.error ?? `DeepSeek 消息发送过于频繁，${DEEPSEEK_RATE_LIMIT_RETRY_MS / 60_000} 分钟后重试`,
         retryAfterMs: DEEPSEEK_RATE_LIMIT_RETRY_MS,
+        continuationRetryAfterMs: DEEPSEEK_CONTINUATION_PROBE_MS,
       };
     }
     return { status: 'ambiguous', detail: reply?.error ?? 'DeepSeek 提交结果不明确' };
@@ -382,7 +456,43 @@ export class DeepSeekProviderHost implements ProviderHost {
 
   async inspect(connectionId: string, unit: CurrentUnit): Promise<ProviderInspection> {
     const tabId = tabIdOf(connectionId);
+    const limited: ProviderInspection = {
+      status: 'rate_limited',
+      detail: 'DeepSeek 消息发送过于频繁，请稍后重试',
+      retryAfterMs: DEEPSEEK_RATE_LIMIT_RETRY_MS,
+      continuationRetryAfterMs: DEEPSEEK_CONTINUATION_PROBE_MS,
+      remoteRef: unit.remoteRef,
+    };
+    if (unit.manualIntervention) {
+      // 用户已在网页端完成手工操作；这里只读状态和回复，绝不再次点击“继续生成”。
+      await ensureTabAvailable(tabId);
+      const status = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+      if (status?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
+      const reply = await send(tabId, command({
+        type: 'readReply',
+        marker: unit.marker,
+        expectJson: unit.outputFormat !== 'text',
+      })) as { found?: boolean; text?: string; error?: string } | null;
+      const latestStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+      if (latestStatus?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
+      if (reply?.found && typeof reply.text === 'string' && reply.text.trim()) {
+        return { status: 'complete', reply: reply.text, remoteRef: unit.remoteRef };
+      }
+      if (status?.state === 'rate_limited' || latestStatus?.state === 'rate_limited') return limited;
+      return {
+        status: 'missing',
+        detail: reply?.error ?? '未确认手工继续生成产生回复',
+        remoteRef: unit.remoteRef,
+      };
+    }
     const asInspection = (result: DeepSeekContinuationResult): ProviderInspection | null => {
+      if (result.evidence === 'repeated_tail') {
+        return {
+          status: 'retry_current',
+          detail: result.detail ?? '检测到回复尾部连续重复，重新创建会话重试当前单元',
+          remoteRef: unit.remoteRef,
+        };
+      }
       if (result.confirmed) return { status: 'generating', remoteRef: unit.remoteRef };
       if (!result.found) return null;
       return {
@@ -393,6 +503,13 @@ export class DeepSeekProviderHost implements ProviderHost {
       };
     };
     await ensureTabAvailable(tabId);
+    // 先查官方通知，避免页面已经限流时仍点击“继续生成”。
+    try {
+      const firstStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+      if (firstStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
+    } catch {
+      // 旧脚本或导航中的页面仍沿用下面的探活与重注入流程。
+    }
     // 续写不应被 Content Script 探活阻塞；页面按钮存在时直接恢复生成。
     let directResult: DeepSeekContinuationResult = { found: false, attempted: false, confirmed: false };
     try {
@@ -402,9 +519,11 @@ export class DeepSeekProviderHost implements ProviderHost {
     }
     if (!shouldTryContinuationFallback(directResult)) {
       const directContinuation = asInspection(directResult);
-      if (directContinuation) return directContinuation;
+      if (directContinuation && !(unit.rateLimited && directContinuation.status === 'unavailable')) return directContinuation;
     }
     await waitUntilReady(tabId, unit.remoteRef ?? undefined);
+    const readyStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+    if (readyStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
     // “继续生成”是生成达到上限后的终态控件，必须优先于普通生成状态探测。
     // DeepSeek 可能同时保留一个可见但 disabled 的主按钮；若先查 status，
     // 会把这种状态误判为仍在生成，从而永远跳过继续按钮。
@@ -414,11 +533,16 @@ export class DeepSeekProviderHost implements ProviderHost {
     })) as DeepSeekContinuationResult | null;
     if (continuation) {
       const continuationInspection = asInspection(continuation);
-      if (continuationInspection) return continuationInspection;
+      if (continuationInspection && !(unit.rateLimited && continuationInspection.status === 'unavailable')) {
+        return continuationInspection;
+      }
     }
     const status = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+    if (status?.state === 'rate_limited' && !unit.rateLimited) return limited;
     if (status?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
-    if (status?.state !== 'idle') return { status: 'unavailable', detail: 'DeepSeek Adapter 暂不可用', retryAfterMs: 5_000 };
+    if (status?.state !== 'idle' && !(unit.rateLimited && status?.state === 'rate_limited')) {
+      return { status: 'unavailable', detail: 'DeepSeek Adapter 暂不可用', retryAfterMs: 5_000 };
+    }
     const reply = await send(tabId, command({
       type: 'readReply',
       marker: unit.marker,
@@ -435,10 +559,13 @@ export class DeepSeekProviderHost implements ProviderHost {
       })) as DeepSeekContinuationResult | null;
       if (continuationAfterReply) {
         const continuationInspection = asInspection(continuationAfterReply);
-        if (continuationInspection) return continuationInspection;
+        if (continuationInspection && !(unit.rateLimited && continuationInspection.status === 'unavailable')) {
+          return continuationInspection;
+        }
       }
       // 读取回复期间生成状态可能发生变化；以最新状态为准，避免把仍在生成的半成品交给核心。
       const latestStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+      if (latestStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
       if (latestStatus?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
       return { status: 'complete', reply: reply.text, remoteRef: unit.remoteRef };
     }
@@ -449,9 +576,12 @@ export class DeepSeekProviderHost implements ProviderHost {
     })) as DeepSeekContinuationResult | null;
     if (continuationAfterRead) {
       const continuationInspection = asInspection(continuationAfterRead);
-      if (continuationInspection) return continuationInspection;
+      if (continuationInspection && !(unit.rateLimited && continuationInspection.status === 'unavailable')) {
+        return continuationInspection;
+      }
     }
     const latestStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+    if (latestStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
     if (latestStatus?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
     const marker = await send(tabId, command({ type: 'hasMarker', marker: unit.marker })) as { has?: boolean } | null;
     return { status: 'missing', detail: marker?.has ? '已找到请求 marker，但尚未找到对应回复' : '当前会话中没有请求 marker' };

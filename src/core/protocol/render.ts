@@ -34,7 +34,7 @@ function renderKnowledgeSections(r: ExtractionResult): string {
     lines.push('');
   }
   if (r.knowledge.length > 0) {
-    lines.push('## 知识条目', '');
+    lines.push('## 提取结果', '');
     for (const item of r.knowledge) {
       const when = item.time ? `（${normalizeDisplayTime(item.time)}）` : '';
       lines.push(`- ${when} **${item.category}｜${item.topic}**：${item.content}`.trim());
@@ -50,20 +50,22 @@ function renderKnowledgeSections(r: ExtractionResult): string {
   return lines.join('\n');
 }
 
-/** 把最终知识结构渲染成 Markdown 报告（本地确定性渲染，不消耗任何 LLM 请求） */
-export function renderKnowledgeMarkdown(r: ExtractionResult, title: string): string {
-  return `# ${title}\n\n${renderKnowledgeSections(r)}\n`;
+/** 把结构化结果渲染成 Markdown 报告（本地确定性渲染，不消耗任何 LLM 请求） */
+export function renderKnowledgeMarkdown(r: ExtractionResult, title: string, taskInstruction = ''): string {
+  const goal = taskInstruction.trim();
+  return `# ${title}\n\n${goal ? `> 目标：${goal.replace(/\r?\n/g, ' ')}\n\n` : ''}${renderKnowledgeSections(r)}\n`;
 }
 
-/** 将结构化知识包装成可直接放入公司 AI 助手的 SKILL.md。 */
-export function renderSkillMarkdown(r: ExtractionResult, title: string): string {
-  const safeTitle = title.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Company Knowledge';
+/** 将结构化结果包装成可复用的 SKILL.md。 */
+export function renderSkillMarkdown(r: ExtractionResult, title: string, taskInstruction = ''): string {
+  const safeTitle = title.replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim() || 'Structured Results';
   const slug = safeTitle
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
-    .slice(0, 64) || 'company-knowledge';
-  const description = `${safeTitle}的结构化公司知识。回答相关问题时优先依据本 Skill，证据不足时明确说明未知，不得臆造。`;
-  return `---\nname: ${slug}\ndescription: ${JSON.stringify(description)}\n---\n\n# ${safeTitle}\n\n## 使用说明\n\n你是公司内部知识助手。回答与本主题相关的问题时，优先使用下方已提炼且有原文依据的知识；不要把推测当作事实，遇到冲突或信息不足时明确说明。\n\n${renderKnowledgeSections(r)}\n`;
+    .slice(0, 64) || 'structured-results';
+  const description = `${safeTitle}的结构化结果。使用时以原任务目标为准，区分事实与归纳判断，证据不足时明确说明。`;
+  const goal = taskInstruction.trim();
+  return `---\nname: ${slug}\ndescription: ${JSON.stringify(description)}\n---\n\n# ${safeTitle}\n\n## 使用说明\n\n${goal ? `原任务目标：${goal.replace(/\r?\n/g, ' ')}\n\n` : ''}回答或复用下方内容时，以原任务目标为准；保留事实、归纳判断与建议的区别，遇到冲突或依据不足时明确说明。\n\n${renderKnowledgeSections(r)}\n`;
 }

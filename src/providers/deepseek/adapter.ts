@@ -9,25 +9,25 @@
  */
 import type { AdapterEvent } from '../../core/messaging';
 import type { DeepSeekCommand, DeepSeekContinuationResult } from './messages';
-import { DEEPSEEK_RATE_LIMIT_RETRY_MS } from './policy';
 import {
   INPUT_SELECTORS,
   MARKDOWN_SELECTORS,
   NEW_CHAT_SELECTORS,
-  RATE_LIMIT_PATTERNS,
   SEND_BUTTON_DISABLED_CLASS,
   SEND_BUTTON_SELECTORS,
+  findRateLimitNotice,
+  isRateLimitNoticeText,
   queryAll,
   queryFirst,
 } from './selectors';
+import { DEEPSEEK_CONTINUATION_PROBE_MS, DEEPSEEK_RATE_LIMIT_RETRY_MS } from './policy';
 
 const TICK_MS = 250;
 const HEARTBEAT_MS = 1_000;
-const RATE_CHECK_MS = 2_000;
-const RATE_COOLDOWN_MS = 30_000;
 /** 发送后等待会话 URL 出现的最长时间（DeepSeek 首 token 前 URL 就会变） */
 const URL_WAIT_MS = 10_000;
 const ACCEPT_STABILITY_MS = 600;
+const RATE_LIMIT_NOTICE_GRACE_MS = 30_000;
 /** 兜底护栏：同一会话已堆积这么多回复时禁止继续发送（应由引擎的独立对话逻辑避免） */
 const MAX_MD_PER_CHAT = 40;
 const MAIN_PROBE_REQUEST = '__lcwReqV5';
@@ -64,6 +64,17 @@ function hasCompleteJsonObject(text: string): boolean {
   return false;
 }
 
+function hasRepeatedReplyTail(text: string): boolean {
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  const maxPartLength = Math.min(256, Math.floor(normalized.length / 3));
+  for (let partLength = 12; partLength <= maxPartLength; partLength++) {
+    if (partLength * 3 < 120) continue;
+    const part = normalized.slice(-partLength);
+    if (normalized.slice(-partLength * 3) === part.repeat(3)) return true;
+  }
+  return false;
+}
+
 /** DeepSeek 输入框是受控组件，必须走原生 setter + input 事件才能被框架感知 */
 function setNativeValue(el: HTMLTextAreaElement, value: string): void {
   const desc = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
@@ -77,11 +88,11 @@ function setNativeValue(el: HTMLTextAreaElement, value: string): void {
 export class DeepSeekAdapter {
   private generating = false;
   private lastTick = 0;
-  private lastRateCheck = 0;
-  private lastRateHit = 0;
   private tickRunning = false;
   private lastContinueMarker = '';
   private lastContinueAt = 0;
+  private rateLimitNoticeVisible = false;
+  private lastRateLimitReportAt = 0;
 
   private reqId = 0;
 
@@ -107,7 +118,11 @@ export class DeepSeekAdapter {
   }
 
   start(): void {
-    new MutationObserver(() => this.tick()).observe(document.body, {
+    new MutationObserver((mutations) => {
+      // Toast 可能在提交已确认后才出现，且几秒内消失；不能只在发送确认窗口检查。
+      this.observeRateLimitNotice(mutations);
+      this.tick();
+    }).observe(document.body, {
       childList: true,
       subtree: true,
       characterData: true,
@@ -123,7 +138,13 @@ export class DeepSeekAdapter {
       case 'status': {
         if (!this.findInput()) return { state: 'unknown' };
         const gen = await this.isGenerating();
-        return { state: gen ? 'generating' : 'idle' };
+        // 限流提示可能在人工点击“继续生成”后仍短暂残留；生成状态优先，
+        // 否则后台会把真实的续写误判成仍在限流而跳过结果对账。
+        if (gen) return { state: 'generating' };
+        if (this.checkRateLimitNotice() || Date.now() - this.lastRateLimitReportAt < RATE_LIMIT_NOTICE_GRACE_MS) {
+          return { state: 'rate_limited' };
+        }
+        return { state: 'idle' };
       }
       case 'newChat':
         return this.newChat();
@@ -184,6 +205,16 @@ export class DeepSeekAdapter {
     });
     const button = candidates.at(-1);
     if (!button) return { found: false, attempted: false, confirmed: false };
+    const currentReply = queryAll(MARKDOWN_SELECTORS).map((el) => el.textContent ?? '').join('\n');
+    if (hasRepeatedReplyTail(currentReply)) {
+      return {
+        found: true,
+        attempted: false,
+        confirmed: false,
+        evidence: 'repeated_tail',
+        detail: '检测到回复尾部连续重复，停止继续生成并重新创建会话重试',
+      };
+    }
     const beforeReplyLength = queryAll(MARKDOWN_SELECTORS)
       .reduce((total, el) => total + (el.textContent ?? '').length, 0);
     button.scrollIntoView({ block: 'center', inline: 'center' });
@@ -291,6 +322,7 @@ export class DeepSeekAdapter {
   }
 
   private tick(): void {
+    this.checkRateLimitNotice();
     const now = Date.now();
     if (now - this.lastTick < TICK_MS || this.tickRunning) return;
     this.lastTick = now;
@@ -302,26 +334,58 @@ export class DeepSeekAdapter {
           this.generating = generating;
           this.emit({ channel: 'adapter', type: generating ? 'generationStart' : 'generationEnd' });
         }
-        // 限流扫描只在空闲时低频进行（全文 innerText 有成本）
-        const checkedAt = Date.now();
-        if (!generating && checkedAt - this.lastRateCheck > RATE_CHECK_MS && checkedAt - this.lastRateHit > RATE_COOLDOWN_MS) {
-          this.lastRateCheck = checkedAt;
-          const text = document.body?.innerText ?? '';
-          for (const pattern of RATE_LIMIT_PATTERNS) {
-            if (pattern.test(text)) {
-              this.lastRateHit = checkedAt;
-              this.emit({
-                channel: 'adapter',
-                type: 'rateLimited',
-                detail: 'DeepSeek 消息发送过于频繁，30 分钟后重试',
-                retryAfterMs: DEEPSEEK_RATE_LIMIT_RETRY_MS,
-              });
-              break;
-            }
-          }
-        }
       })
       .finally(() => { this.tickRunning = false; });
+  }
+
+  private checkRateLimitNotice(): boolean {
+    const notice = findRateLimitNotice();
+    if (!notice) {
+      this.rateLimitNoticeVisible = false;
+      return false;
+    }
+    if (!this.rateLimitNoticeVisible) {
+      this.rateLimitNoticeVisible = true;
+      this.reportRateLimit(notice);
+    }
+    return true;
+  }
+
+  private reportRateLimit(detail: string): void {
+    const now = Date.now();
+    if (now - this.lastRateLimitReportAt < 10_000) return;
+    this.lastRateLimitReportAt = now;
+    this.emit({
+      channel: 'adapter',
+      type: 'rateLimited',
+      detail,
+      retryAfterMs: DEEPSEEK_RATE_LIMIT_RETRY_MS,
+      continuationRetryAfterMs: DEEPSEEK_CONTINUATION_PROBE_MS,
+    });
+  }
+
+  private observeRateLimitNotice(mutations: MutationRecord[]): void {
+    if (this.checkRateLimitNotice()) return;
+    // 部分版本的通知没有 toast/alert 语义类。只在 DOM 变更时检查短文本，
+    // 且要求其位于悬浮容器内，避免扫描并误判长篇聊天正文。
+    for (const mutation of mutations) {
+      const nodes = mutation.type === 'characterData' ? [mutation.target] : Array.from(mutation.addedNodes);
+      for (const node of nodes) {
+        let element = node instanceof Element ? node : node.parentElement;
+        for (let depth = 0; element && depth < 5; depth++, element = element.parentElement) {
+          const text = (element.textContent ?? '').replace(/\s+/g, ' ').trim();
+          if (text.length > 160 || !isRateLimitNoticeText(text)) continue;
+          if (element.closest('.ds-markdown, .ds-assistant-message-main-content, textarea')) continue;
+          let floating: Element | null = element;
+          for (let ancestor = 0; floating && ancestor < 5; ancestor++, floating = floating.parentElement) {
+            if (getComputedStyle(floating).position !== 'fixed') continue;
+            this.rateLimitNoticeVisible = true;
+            this.reportRateLimit(text);
+            return;
+          }
+        }
+      }
+    }
   }
 
   /** 开新对话：优先点"开启新对话"按钮（无 aria-label，按文本找），失败则跳首页 */
@@ -410,8 +474,8 @@ export class DeepSeekAdapter {
       if (bodyText.includes('有消息正在生成，请稍后再试')) {
         return { outcome: 'retryable', url, error: 'DeepSeek 仍有消息正在生成' };
       }
-      if (RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(bodyText))) {
-        return { outcome: 'rate_limited', url, error: 'DeepSeek 消息发送过于频繁，30 分钟后重试' };
+      if (findRateLimitNotice()) {
+        return { outcome: 'rate_limited', url, error: `DeepSeek 消息发送过于频繁，${DEEPSEEK_RATE_LIMIT_RETRY_MS / 60_000} 分钟后重试` };
       }
       const input = this.findInput();
       const generating = await this.isGenerating();

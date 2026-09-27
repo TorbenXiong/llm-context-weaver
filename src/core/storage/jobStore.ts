@@ -1,9 +1,65 @@
 import { normalizeJobConfig } from '../config/smartDefaults';
-import type { ChunkMeta, ChunkText, Job, JobConfig, JobProgress, ResultRecord } from '../types';
+import type { ChunkMeta, ChunkText, Job, JobConfig, JobEvent, JobProgress, RateLimitEvent, ResultRecord, TrafficSample } from '../types';
 import { newId, shortId } from '../util/ids';
 import { idb, kv, openDb } from './db';
 
 const chunkId = (jobId: string, index: number): string => `${jobId}:${index}`;
+/** 覆盖大任务一小时内数百个会话，避免输出预算统计因旧样本被截掉而失真。 */
+const TRAFFIC_HISTORY_LIMIT = 1_024;
+export const JOB_EVENT_LOG_LIMIT = 2_000;
+
+const normalizeJob = (job: Job): Job => ({
+  ...job,
+  config: normalizeJobConfig(job.config),
+  providerSessionRefs: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs : [],
+  trafficHistory: Array.isArray(job.trafficHistory) ? job.trafficHistory : [],
+  rateLimitEvents: (() => {
+    if (!Array.isArray(job.rateLimitEvents)) return [];
+    let cumulativeInput = 0;
+    let cumulativeOutput = 0;
+    return job.rateLimitEvents.map((event): RateLimitEvent => {
+      // 旧任务只有 inputChars/outputChars；补齐新字段后工作台和策略可明确区分
+      // “本轮新增”与“累计”，且不改变旧记录的原始数值。
+      const intervalInput = Number.isFinite(event.intervalInputChars)
+        ? event.intervalInputChars!
+        : Math.max(0, event.inputChars ?? 0);
+      const intervalOutput = Number.isFinite(event.intervalOutputChars)
+        ? event.intervalOutputChars!
+        : Math.max(0, event.outputChars ?? 0);
+      cumulativeInput = Number.isFinite(event.cumulativeInputChars)
+        ? event.cumulativeInputChars!
+        : cumulativeInput + intervalInput;
+      cumulativeOutput = Number.isFinite(event.cumulativeOutputChars)
+        ? event.cumulativeOutputChars!
+        : cumulativeOutput + intervalOutput;
+      return {
+        ...event,
+        intervalInputChars: intervalInput,
+        intervalOutputChars: intervalOutput,
+        cumulativeInputChars: cumulativeInput,
+        cumulativeOutputChars: cumulativeOutput,
+      };
+    });
+  })(),
+  eventLog: Array.isArray(job.eventLog) ? job.eventLog.slice(-JOB_EVENT_LOG_LIMIT) : [],
+});
+
+export function appendJobEvent(job: Job, kind: string, detail: string): Job {
+  const event: JobEvent = { at: Date.now(), kind, detail: detail.slice(0, 500) };
+  return { ...job, eventLog: [...(job.eventLog ?? []), event].slice(-JOB_EVENT_LOG_LIMIT) };
+}
+
+const withOutputTraffic = (job: Job, marker: string, outputChars: number): Job => {
+  const history = Array.isArray(job.trafficHistory) ? job.trafficHistory : [];
+  const completedAt = Date.now();
+  let changed = false;
+  const next = history.map((sample) => {
+    if (sample.marker !== marker || sample.outputChars != null) return sample;
+    changed = true;
+    return { ...sample, outputChars, completedAt };
+  });
+  return changed ? { ...job, trafficHistory: next } : job;
+};
 
 export async function createJob(name: string, config: JobConfig, providerId: string, totalChunks = 0): Promise<Job> {
   const id = newId();
@@ -21,9 +77,15 @@ export async function createJob(name: string, config: JobConfig, providerId: str
     providerConnectionId: null,
     providerSessionRefs: [],
     sessionCooldownUntil: undefined,
+    sessionCooldownStartedAt: undefined,
+    sessionCooldownReason: undefined,
+    trafficHistory: [],
+    rateLimitEvents: [],
+    eventLog: [],
     current: null,
     reduceState: null,
     formatState: null,
+    formatPlanResultId: null,
     totalChunks,
     failedChunks: [],
     finalResultId: null,
@@ -36,20 +98,14 @@ export async function createJob(name: string, config: JobConfig, providerId: str
 
 export async function getJob(jobId: string): Promise<Job | undefined> {
   const job = await idb.get<Job>('jobs', jobId);
-  return job
-    ? { ...job, config: normalizeJobConfig(job.config), providerSessionRefs: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs : [] }
-    : undefined;
+  return job ? normalizeJob(job) : undefined;
 }
 
 export const saveJob = (job: Job): Promise<IDBValidKey> => idb.put('jobs', { ...job, updatedAt: Date.now() });
 
 export const listJobs = async (): Promise<Job[]> =>
   (await idb.getAll<Job>('jobs'))
-    .map((job) => ({
-      ...job,
-      config: normalizeJobConfig(job.config),
-      providerSessionRefs: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs : [],
-    }))
+    .map(normalizeJob)
     .sort((a, b) => b.createdAt - a.createdAt);
 
 export async function deleteJob(jobId: string): Promise<void> {
@@ -141,14 +197,23 @@ export async function markUnitSubmitted(
       const sessionRefs = remoteRef && !knownSessionRefs.includes(remoteRef)
         ? [...knownSessionRefs, remoteRef]
         : knownSessionRefs;
-      const next: Job = {
+      const now = Date.now();
+      const trafficHistory = already
+        ? (Array.isArray(job.trafficHistory) ? job.trafficHistory : [])
+        : [...(Array.isArray(job.trafficHistory) ? job.trafficHistory : []), {
+          marker,
+          submittedAt: now,
+          inputChars: Math.max(0, job.current.inputChars ?? 0),
+        } satisfies TrafficSample].slice(-TRAFFIC_HISTORY_LIMIT);
+      const next: Job = appendJobEvent({
         ...job,
         providerConnectionId: connectionId,
         providerSessionRefs: sessionRefs,
         current: { ...job.current, phase: 'acknowledged', remoteRef: remoteRef ?? job.current.remoteRef ?? null },
+        trafficHistory,
         stats: already ? job.stats : { ...job.stats, sent: job.stats.sent + 1 },
-        updatedAt: Date.now(),
-      };
+        updatedAt: now,
+      }, 'submitted', `${kind}/${job.current.ref} 已确认提交（第 ${job.current.attempt} 次）`);
       jobs.put(next);
       if ((kind === 'index' || kind === 'extract') && index != null) {
         const metaReq = chunks.get(chunkId(jobId, index));
@@ -186,8 +251,16 @@ export async function commitIndexed(
       if (!job?.current || job.current.marker !== marker) return;
       const resultReq = results.get(result.id);
       resultReq.onsuccess = () => {
-        if (resultReq.result) { output = job; return; }
-        results.put(result);
+        // 结果记录可能已在上一次事务中写入，但 Job 指针因扩展重载尚未推进。
+        // 不能直接返回，否则页面已有完整回复而任务会永久卡在 current。
+        // 同一结果 ID 代表同一 attempt，保留已写入正文并继续完成指针推进。
+        const committedResult = resultReq.result as ResultRecord | undefined;
+        if (!committedResult) results.put(result);
+        const trafficMarker = job.current!.marker;
+        const trafficUnit = job.current!;
+        // 限流期间如果当前远端会话确实产出了完整回复，说明用户手动续写已让
+        // 当前会话恢复。清除任务级冷却，避免收集完成后 pump 仍被旧冷却拦截。
+        const recoveredFromRateLimit = trafficUnit.rateLimited === true;
         const metaReq = chunks.get(chunkId(jobId, chunkIndex));
         metaReq.onsuccess = () => {
           const meta = metaReq.result as ChunkMeta | undefined;
@@ -200,15 +273,19 @@ export async function commitIndexed(
             error: null,
           });
         };
-        output = {
+        output = withOutputTraffic(appendJobEvent({
           ...job,
           current: null,
+          sessionCooldownUntil: recoveredFromRateLimit ? undefined : job.sessionCooldownUntil,
+          sessionCooldownStartedAt: recoveredFromRateLimit ? undefined : job.sessionCooldownStartedAt,
+          sessionCooldownReason: recoveredFromRateLimit ? undefined : job.sessionCooldownReason,
           status: job.status === 'paused' ? 'paused' : 'processing',
           prevStatus: job.status === 'paused' ? 'processing' : job.prevStatus,
           lastError: null,
           stats: { ...job.stats, collected: job.stats.collected + 1 },
           updatedAt: Date.now(),
-        };
+        }, 'collected', `${trafficUnit.kind}/${trafficUnit.ref} 已收集回复${recoveredFromRateLimit ? '；限流期间当前会话已恢复，继续任务调度' : ''}`), trafficMarker,
+        (committedResult ?? result).raw.length);
         jobs.put(output);
       };
     };
@@ -228,6 +305,7 @@ export async function commitCollected(
   chunkIndex?: number,
   reduceState?: Job['reduceState'],
   formatState?: Job['formatState'],
+  formatPlanResultId?: string | null,
 ): Promise<Job | undefined> {
   const db = await openDb();
   return new Promise<Job | undefined>((resolve, reject) => {
@@ -245,8 +323,13 @@ export async function commitCollected(
       const resultReq = results.get(result.id);
       resultReq.onsuccess = () => {
         const existing = resultReq.result as ResultRecord | undefined;
-        if (existing) { output = job; return; }
-        results.put(result);
+        // 结果可能已经写入，但任务指针尚未推进（例如扩展重载发生在两步之间）。
+        // 继续执行收集提交，避免任务永久停在 current。
+        if (!existing) results.put(result);
+        const trafficMarker = job.current!.marker;
+        const trafficUnit = job.current!;
+        // 同上：人工继续生成并成功收集结果是限流恢复的可靠证据。
+        const recoveredFromRateLimit = trafficUnit.rateLimited === true;
         if (chunkIndex != null) {
           const metaReq = chunks.get(chunkId(jobId, chunkIndex));
           metaReq.onsuccess = () => {
@@ -254,17 +337,22 @@ export async function commitCollected(
             if (meta) chunks.put({ ...meta, status: 'done', stage: 'done', resultId: result.id, error: null });
           };
         }
-        output = {
+        output = withOutputTraffic(appendJobEvent({
           ...job,
           current: null,
+          sessionCooldownUntil: recoveredFromRateLimit ? undefined : job.sessionCooldownUntil,
+          sessionCooldownStartedAt: recoveredFromRateLimit ? undefined : job.sessionCooldownStartedAt,
+          sessionCooldownReason: recoveredFromRateLimit ? undefined : job.sessionCooldownReason,
           status: job.status === 'paused' ? 'paused' : nextStatus,
           prevStatus: job.status === 'paused' ? nextStatus : job.prevStatus,
           reduceState: reduceState === undefined ? job.reduceState : reduceState,
           formatState: formatState === undefined ? job.formatState : formatState,
+          formatPlanResultId: formatPlanResultId === undefined ? job.formatPlanResultId : formatPlanResultId,
           lastError: null,
           stats: { ...job.stats, collected: job.stats.collected + 1 },
           updatedAt: Date.now(),
-        };
+        }, 'collected', `${trafficUnit.kind}/${trafficUnit.ref} 已收集回复${recoveredFromRateLimit ? '；限流期间当前会话已恢复，继续任务调度' : ''}`), trafficMarker,
+        (existing ?? result).raw.length);
         if (job.status !== 'paused' && nextStatus === 'reducing' && reduceState) output.reduceState = reduceState;
         jobs.put(output);
       };
@@ -315,6 +403,20 @@ export const getChunkMeta = (jobId: string, index: number): Promise<ChunkMeta | 
   idb.get<ChunkMeta>('chunks', chunkId(jobId, index));
 
 export const saveChunkMeta = (meta: ChunkMeta): Promise<IDBValidKey> => idb.put('chunks', meta);
+
+/** 重跑只切换当前任务与受影响分块的指针，历史结果和日志全部保留。 */
+export async function commitReprocessPlan(job: Job, metas: ChunkMeta[]): Promise<void> {
+  const db = await openDb();
+  await new Promise<void>((resolve, reject) => {
+    const t = db.transaction(['jobs', 'chunks'], 'readwrite');
+    t.objectStore('jobs').put({ ...job, updatedAt: Date.now() });
+    const chunks = t.objectStore('chunks');
+    for (const meta of metas) chunks.put(meta);
+    t.oncomplete = () => resolve();
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+  });
+}
 
 export const getChunkTextById = async (id: string): Promise<string | undefined> =>
   (await idb.get<ChunkText>('chunkTexts', id))?.text;

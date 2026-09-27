@@ -129,6 +129,17 @@ declare global {
     return q(MARKDOWN_SELECTORS).reduce((total, el) => total + (el.textContent ?? '').length, 0);
   }
 
+  function hasRepeatedReplyTail(text: string): boolean {
+    const normalized = text.replace(/\s+/g, ' ').trim();
+    const maxPartLength = Math.min(256, Math.floor(normalized.length / 3));
+    for (let partLength = 12; partLength <= maxPartLength; partLength++) {
+      if (partLength * 3 < 120) continue;
+      const part = normalized.slice(-partLength);
+      if (normalized.slice(-partLength * 3) === part.repeat(3)) return true;
+    }
+    return false;
+  }
+
   function dispatchPointerClick(button: HTMLElement): void {
     button.scrollIntoView({ block: 'center', inline: 'center' });
     button.focus({ preventScroll: true });
@@ -182,6 +193,16 @@ declare global {
     // 工作单元，因此最后一个可见按钮是安全的兜底目标。
     const button = (afterMarker.length > 0 ? afterMarker : candidates).at(-1);
     if (!button) return { found: false, attempted: false, confirmed: false };
+    const currentReply = readReply(marker).text ?? q(MARKDOWN_SELECTORS).map((el) => el.textContent ?? '').join('\n');
+    if (hasRepeatedReplyTail(currentReply)) {
+      return {
+        found: true,
+        attempted: false,
+        confirmed: false,
+        evidence: 'repeated_tail',
+        detail: '检测到回复尾部连续重复，停止继续生成并重新创建会话重试',
+      };
+    }
     if (lastContinueMarker === marker && Date.now() - lastContinueAt < 3_000) {
       return {
         found: true,

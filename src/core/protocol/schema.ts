@@ -1,7 +1,6 @@
 /**
- * 知识提炼协议（统一 knowledge 条目结构）。
- * 该契约属于核心层资产：所有 Provider 的输出都必须被清洗成同一结构，
- * Adapter 只搬运文本，不自定义结果格式。
+ * 知识提炼协议（默认统一 knowledge 条目结构，任务也可通过动态格式规范选择 JSON 形态）。
+ * 该契约属于核心层资产：Provider 只搬运文本，解析和敏感信息过滤由核心负责。
  */
 export const EXTRACTION_SCHEMA_VERSION = 3;
 
@@ -51,6 +50,13 @@ export interface FormatCategory {
   aliases?: string[];
 }
 
+export interface FormatOutput {
+  mode: 'knowledge' | 'json';
+  topLevelKey?: string;
+  itemFields?: string[];
+  description?: string;
+}
+
 export interface FormatPlan {
   version: 1;
   categories: FormatCategory[];
@@ -61,6 +67,8 @@ export interface FormatPlan {
     details?: string;
     merge?: string;
   };
+  /** 由任务目标和样本决定的业务输出形态；缺失时兼容旧任务并按 knowledge 处理。 */
+  output?: FormatOutput;
 }
 
 /** 从模型回复中提取 JSON：优先 ```json 代码块，否则做带字符串感知的平衡括号扫描 */
@@ -103,6 +111,10 @@ export function parseJsonResult(raw: string): JsonResult | null {
   } catch {
     return null;
   }
+}
+
+export function isJsonResult(value: unknown): value is JsonResult {
+  return typeof value === 'object' && value !== null;
 }
 
 /** 索引阶段契约比最终结果严格：下一阶段必须能据此回到原文定位。 */
@@ -160,7 +172,42 @@ export function parseFormatPlan(raw: string): FormatPlan | null {
     if (value) rules[key] = value;
   }
   if (Object.keys(rules).length === 0) return null;
-  return { version: 1, categories, rules };
+  const outputValue = parsed['output'];
+  let output: FormatOutput | undefined;
+  if (outputValue !== undefined) {
+    if (typeof outputValue !== 'object' || outputValue === null || Array.isArray(outputValue)) return null;
+    const outputSource = outputValue as Record<string, unknown>;
+    const mode = outputSource['mode'];
+    if (mode !== 'knowledge' && mode !== 'json') return null;
+    const topLevelKey = asString(outputSource['topLevelKey']);
+    const description = asString(outputSource['description']);
+    const itemFieldsValue = outputSource['itemFields'];
+    if (itemFieldsValue !== undefined && (!Array.isArray(itemFieldsValue) || itemFieldsValue.some((field) => typeof field !== 'string'))) return null;
+    const itemFields = Array.isArray(itemFieldsValue) ? itemFieldsValue.map((field) => field.trim()).filter(Boolean) : undefined;
+    output = {
+      mode,
+      ...(topLevelKey ? { topLevelKey } : {}),
+      ...(itemFields && itemFields.length > 0 ? { itemFields } : {}),
+      ...(description ? { description } : {}),
+    };
+  }
+  return { version: 1, categories, rules, ...(output ? { output } : {}) };
+}
+
+export function isFormatPlan(value: unknown): value is FormatPlan {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const plan = value as Record<string, unknown>;
+  return plan.version === 1
+    && Array.isArray(plan.categories)
+    && typeof plan.rules === 'object'
+    && plan.rules !== null
+    && !Array.isArray(plan.rules)
+    && (plan.output === undefined || (
+      typeof plan.output === 'object'
+      && plan.output !== null
+      && !Array.isArray(plan.output)
+      && ((plan.output as Record<string, unknown>).mode === 'knowledge' || (plan.output as Record<string, unknown>).mode === 'json')
+    ));
 }
 
 export function isExtractionResult(value: unknown): value is ExtractionResult {
@@ -347,4 +394,9 @@ export function sanitizeExtraction(raw: string): ExtractionResult | null {
     knowledge,
     ...(people && people.length > 0 ? { people } : {}),
   });
+}
+
+/** 动态 JSON 输出沿用统一敏感信息过滤，但不强制套用 knowledge 字段。 */
+export function sanitizeJsonResult(value: JsonResult): JsonResult {
+  return sanitizeValue(value) as JsonResult;
 }

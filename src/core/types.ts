@@ -18,9 +18,16 @@ export type ChunkStage = 'index' | 'process' | 'done';
 export type DispatchPhase = 'prepared' | 'submitting' | 'acknowledged';
 export type TaskKind = 'knowledge' | 'custom';
 export type PipelineMode = 'staged' | 'direct';
-/** 新建任务时可只导入一部分提炼会话，归并阶段不计入该限制。 */
-export type TestScope = 'all' | 'percent' | 'sessions';
 export type ResultPayload = ExtractionResult | FormatPlan | IndexResult | JsonResult | string;
+
+/** 各阶段可编辑的提示词模板；{{...}} 占位符由核心在发送前替换。 */
+export interface PromptTemplateSet {
+  index: string;
+  extract: string;
+  format: string;
+  normalize: string;
+  reduce: string;
+}
 
 export interface JobConfig {
   /** 多阶段先建立目标相关索引再处理原文；直接模式用于翻译、改写等线性任务。 */
@@ -47,12 +54,8 @@ export interface JobConfig {
   taskKind: TaskKind;
   /** 用户定义的核心任务；模板只补充输出契约与分片处理约束。 */
   taskInstruction: string;
-  /** 测试范围：all=全部，percent=按原文比例，sessions=最多提炼会话数。 */
-  testScope: TestScope;
-  testPercent: number;
-  testSessionLimit: number;
-  /** 知识任务是否在最终归并前生成动态格式规范并分批统一结果。 */
-  formatNormalization: boolean;
+  /** 本任务使用的各阶段提示词模板，创建后随任务持久化。 */
+  promptTemplates: PromptTemplateSet;
 }
 
 export const DEFAULT_JOB_CONFIG: JobConfig = {
@@ -68,10 +71,13 @@ export const DEFAULT_JOB_CONFIG: JobConfig = {
   deleteProviderSessionsOnComplete: false,
   taskKind: 'knowledge',
   taskInstruction: '',
-  testScope: 'all',
-  testPercent: 100,
-  testSessionLimit: 0,
-  formatNormalization: true,
+  promptTemplates: {
+    index: '',
+    extract: '',
+    format: '',
+    normalize: '',
+    reduce: '',
+  },
 };
 
 /** 当前在途工作单元。Provider 运行时只能把远端状态作为不透明引用返回给核心。 */
@@ -89,12 +95,55 @@ export interface CurrentUnit {
   smartSearch?: boolean;
   /** 命中限流时为 true，重发不消耗 attempt */
   rateLimited?: boolean;
+  /** 用户确认已在网页端手工继续生成；Provider 只读对账，不再自动点击续写。 */
+  manualIntervention?: boolean;
   /** 限流退避截止时间；用于 Service Worker 重启后避免提前重试。 */
   retryAfterAt?: number;
+  /** 旧版本字段，仅为恢复旧任务保留；当前不再自动生成检查。 */
+  continuationProbeAt?: number;
   /** 深度思考任务首次观察到完整回复的时间；稳定窗口结束后才收集。 */
   completionObservedAt?: number;
   /** Provider 返回的不透明远端引用（会话 ID、URL 或其他 locator 均由 Adapter 解释） */
   remoteRef?: string | null;
+  /** 本次待发送提示的字符数，用于 Provider 自己的输入量限流策略。 */
+  inputChars?: number;
+}
+
+/** 已确认提交的输入量与回复量；核心只做遥测持久化，Provider 决定如何解释。 */
+export interface TrafficSample {
+  marker: string;
+  submittedAt: number;
+  inputChars: number;
+  outputChars?: number;
+  /** 回复完整收集的时间；输出预算按此时间进入 Provider 窗口。 */
+  completedAt?: number;
+}
+
+/** 任务运行摘要日志；只保存状态和计数，不保存提示词、回复正文或凭据。 */
+export interface JobEvent {
+  at: number;
+  kind: string;
+  detail: string;
+}
+
+/** 官方限流事件的可审计摘要，不保存提示词或回复正文。 */
+export interface RateLimitEvent {
+  occurredAt: number;
+  sentCount: number;
+  providerSessionCount: number;
+  /** 本次限流事件之间新增的输入量；inputChars 为兼容旧记录的同义字段。 */
+  intervalInputChars?: number;
+  /** 本次限流事件之间新增的输出量；outputChars 为兼容旧记录的同义字段。 */
+  intervalOutputChars?: number;
+  /** 从任务开始、包含历次触发限流请求的累计输入量。 */
+  cumulativeInputChars?: number;
+  /** 从任务开始、包含历次触发限流请求的累计输出量。 */
+  cumulativeOutputChars?: number;
+  /** 旧版本字段，读取时按本次事件新增量处理。 */
+  inputChars: number;
+  outputChars: number;
+  retryAfterMs: number;
+  detail?: string;
 }
 
 export interface ReduceGroup {
@@ -109,6 +158,8 @@ export interface FormatState {
   groups: ReduceGroup[];
   nextGroup: number;
   outputIds: string[];
+  /** 重跑时按组复用未受影响的同阶段结果。 */
+  reusedOutputIds?: Record<number, string>;
 }
 
 export interface ReduceState {
@@ -117,6 +168,8 @@ export interface ReduceState {
   groups: ReduceGroup[];
   nextGroup: number;
   outputIds: string[];
+  /** 重跑时按组复用未受影响的同层归并结果。 */
+  reusedOutputIds?: Record<number, string>;
 }
 
 export interface Job {
@@ -134,12 +187,25 @@ export interface Job {
   providerConnectionId: string | null;
   /** 任务创建的 Provider 会话引用；内容由 Provider 解释，核心只负责持久化。 */
   providerSessionRefs: string[];
-  /** 每完成一批网页会话后的主动冷却截止时间。 */
+  /** Provider 要求下一次发送不得早于此时间。 */
   sessionCooldownUntil?: number;
+  /** 当前冷却开始时间；与 sessionCooldownUntil 属于同一次冷却。 */
+  sessionCooldownStartedAt?: number;
+  /** 主动冷却原因，便于工作台解释为什么暂停。 */
+  sessionCooldownReason?: string;
+  /** 最近已确认提交的输入/输出量摘要，Provider 可据此做滚动窗口限流。 */
+  trafficHistory?: TrafficSample[];
+  /** 最近官方限流事件摘要，供后续任务校准主动节流。 */
+  rateLimitEvents?: RateLimitEvent[];
+  eventLog?: JobEvent[];
   current: CurrentUnit | null;
   reduceState: ReduceState | null;
   /** 知识归档前的动态格式规范与分批统一状态；旧任务缺失时视为 null。 */
   formatState?: FormatState | null;
+  /** 当前生效的动态格式规范结果；后置规范完成后会替换前置规范。 */
+  formatPlanResultId?: string | null;
+  /** 重跑后的 attempt 下限，避免历史结果 ID 与新会话冲突。 */
+  reprocessAttemptBases?: Record<string, number>;
   totalChunks: number;
   failedChunks: number[];
   finalResultId: string | null;

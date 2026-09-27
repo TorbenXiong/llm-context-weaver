@@ -8,14 +8,15 @@ import {
   buildReducePrompt,
   formatMarker,
 } from '../protocol/prompts';
-import { isExtractionResult, parseFormatPlan, parseIndexResult, parseJsonResult, sanitizeExtraction } from '../protocol/schema';
-import type { ProviderHost, ProviderInspection } from '../provider';
+import { isExtractionResult, isFormatPlan, isJsonResult, parseFormatPlan, parseIndexResult, parseJsonResult, sanitizeExtraction, sanitizeJsonResult } from '../protocol/schema';
+import type { ProviderHost, ProviderInspection, ProviderPrepareOutcome } from '../provider';
 import { planGroups } from '../reduce/reducePlanner';
 import {
   chunkMetasByJob,
   commitCollected,
   commitIndexed,
   commitUnitFailure,
+  commitReprocessPlan,
   getActiveJobId,
   getChunkMeta,
   getChunkTextById,
@@ -24,14 +25,17 @@ import {
   jobProgress,
   listJobs,
   markUnitSubmitted,
+  appendJobEvent,
   nextPendingChunk,
   saveChunkMeta,
   saveJob,
   setActiveJobId,
+  resultsByJob,
 } from '../storage/jobStore';
-import type { ChunkMeta, CurrentUnit, FormatState, Job, JobStatus, ResultPayload, ResultRecord, UnitKind } from '../types';
+import type { ChunkMeta, CurrentUnit, FormatState, Job, JobStatus, RateLimitEvent, ResultPayload, ResultRecord, UnitKind } from '../types';
 import { sleep } from '../util/sleep';
 import { isActive, isTerminal, transitionJob } from './stateMachine';
+import { planReprocess } from './reprocess';
 
 export interface EngineHost extends ProviderHost {
   scheduleAlarm(name: string, when: number): void;
@@ -48,10 +52,18 @@ const REGEN_CHECK_MS = 8_000;
 const DEEP_THINKING_RECONCILE_MS = 15_000;
 const DEEP_THINKING_SETTLE_MS = 10_000;
 /** 兼容旧版只持久化 rateLimited=true、没有 retryAfterAt 的任务。 */
-const LEGACY_RATE_LIMIT_GRACE_MS = 30 * 60_000;
-const SESSION_COOLDOWN_BATCH_SIZE = 100;
-const SESSION_COOLDOWN_MS = 10 * 60_000;
+/** 旧任务没有持久化 Provider 的 retryAfterAt 时，保守按 65 分钟恢复。 */
+const LEGACY_RATE_LIMIT_GRACE_MS = 65 * 60_000;
+const RATE_LIMIT_EVENT_HISTORY_LIMIT = 50;
 const errMsg = (error: unknown): string => error instanceof Error ? error.message : String(error);
+
+function hasMeaningfulPayload(value: unknown): boolean {
+  if (typeof value === 'string') return value.trim().length > 0;
+  if (typeof value === 'number' || typeof value === 'boolean') return true;
+  if (Array.isArray(value)) return value.some(hasMeaningfulPayload);
+  if (value && typeof value === 'object') return Object.values(value).some(hasMeaningfulPayload);
+  return false;
+}
 
 interface UnitRef {
   kind: UnitKind;
@@ -86,13 +98,13 @@ export class Engine {
     if (!job || !isActive(job.status)) return;
     if (job.current) return this.reconcile(job, 'pump');
     if (job.status === 'waiting') job = await this.to(job, (job.reduceState || job.formatState) ? 'reducing' : 'processing');
-    if (await this.deferForSessionCooldown(job)) return;
+    if (await this.deferForDispatchCooldown(job)) return;
     if (job.status === 'processing') return this.dispatchNextChunkStage(job);
     if (job.status === 'reducing') return this.dispatchNextReduce(job);
   }
 
-  /** 每 100 个 Provider 网页会话主动冷却 10 分钟，降低触发风控的概率。 */
-  private async deferForSessionCooldown(job: Job): Promise<boolean> {
+  /** 恢复旧版本或已持久化的 Provider 冷却；具体何时冷却由 Provider Adapter 决定。 */
+  private async deferForDispatchCooldown(job: Job): Promise<boolean> {
     const now = Date.now();
     const existing = job.sessionCooldownUntil;
     if (existing != null) {
@@ -100,16 +112,11 @@ export class Engine {
         this.host.scheduleAlarm(RESUME_ALARM(job.id), existing);
         return true;
       }
-      job = { ...job, sessionCooldownUntil: undefined };
+      job = { ...job, sessionCooldownUntil: undefined, sessionCooldownStartedAt: undefined, sessionCooldownReason: undefined };
       await saveJob(job);
       return false;
     }
-    const sessionCount = Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs.length : 0;
-    if (sessionCount === 0 || sessionCount % SESSION_COOLDOWN_BATCH_SIZE !== 0) return false;
-    const cooldownUntil = now + SESSION_COOLDOWN_MS;
-    await saveJob({ ...job, sessionCooldownUntil: cooldownUntil });
-    this.host.scheduleAlarm(RESUME_ALARM(job.id), cooldownUntil);
-    return true;
+    return false;
   }
 
   async pause(jobId: string): Promise<void> {
@@ -127,7 +134,13 @@ export class Engine {
     // 先重新声明活动任务，确保 Adapter ready/generation 事件和后续告警都能找到它。
     await setActiveJobId(jobId);
     job = await this.to(job, job.prevStatus ?? (job.reduceState || job.formatState ? 'reducing' : 'processing'));
-    if (job.current) await this.reconcile(job, 'resume');
+    if (job.current) {
+      if (job.sessionCooldownUntil != null && job.sessionCooldownUntil > Date.now()) {
+        this.host.scheduleAlarm(RESUME_ALARM(job.id), job.sessionCooldownUntil);
+      } else {
+        await this.reconcile(job, 'resume');
+      }
+    }
     else await this.pump(job.id);
   }
 
@@ -146,18 +159,28 @@ export class Engine {
     let job = await getJob(jobId);
     const meta = await getChunkMeta(jobId, index);
     if (!job || !meta || meta.status !== 'failed') return;
+    const cooldownActive = job.sessionCooldownUntil != null && job.sessionCooldownUntil > Date.now();
     await saveChunkMeta({ ...meta, status: 'pending', attempts: 0, resultId: null, error: null });
     job = { ...job, failedChunks: job.failedChunks.filter((value) => value !== index), reduceState: null, formatState: null,
-      finalResultId: null, lastError: null };
+      finalResultId: null, lastError: null,
+      sessionCooldownUntil: cooldownActive ? job.sessionCooldownUntil : undefined,
+      sessionCooldownStartedAt: cooldownActive ? job.sessionCooldownStartedAt : undefined,
+      sessionCooldownReason: cooldownActive ? job.sessionCooldownReason : undefined };
     await saveJob(job);
     if (job.status === 'failed' || job.status === 'completed') job = await this.to(job, 'processing');
-    if (isActive(job.status)) await this.pump(job.id);
+    if (isActive(job.status)) {
+      // 失败任务可能是在扩展重载后手动重试，旧的 activeJobId 不一定还存在。
+      // 先重新声明活动任务，确保 Adapter 事件和后续告警都能找到它。
+      await setActiveJobId(job.id);
+      await this.pump(job.id);
+    }
   }
 
   async retryFailed(jobId: string): Promise<void> {
     let job = await getJob(jobId);
     if (!job) return;
     if (job.status === 'paused' && job.failedChunks.length > 0) {
+      const cooldownActive = job.sessionCooldownUntil != null && job.sessionCooldownUntil > Date.now();
       for (const index of job.failedChunks) {
         const meta = await getChunkMeta(jobId, index);
         if (meta?.status === 'failed') {
@@ -171,6 +194,9 @@ export class Engine {
         formatState: null,
         finalResultId: null,
         lastError: null,
+        sessionCooldownUntil: cooldownActive ? job.sessionCooldownUntil : undefined,
+        sessionCooldownStartedAt: cooldownActive ? job.sessionCooldownStartedAt : undefined,
+        sessionCooldownReason: cooldownActive ? job.sessionCooldownReason : undefined,
       });
       return;
     }
@@ -184,7 +210,18 @@ export class Engine {
       const meta = await getChunkMeta(jobId, index);
       if (meta?.status === 'failed') await saveChunkMeta({ ...meta, status: 'pending', attempts: 0, resultId: null, error: null });
     }
-    job = { ...job, failedChunks: [], reduceState: null, formatState: null, finalResultId: null, lastError: null };
+    const cooldownActive = job.sessionCooldownUntil != null && job.sessionCooldownUntil > Date.now();
+    job = {
+      ...job,
+      failedChunks: [],
+      reduceState: null,
+      formatState: null,
+      finalResultId: null,
+      lastError: null,
+      sessionCooldownUntil: cooldownActive ? job.sessionCooldownUntil : undefined,
+      sessionCooldownStartedAt: cooldownActive ? job.sessionCooldownStartedAt : undefined,
+      sessionCooldownReason: cooldownActive ? job.sessionCooldownReason : undefined,
+    };
     await saveJob(job);
     if (job.status === 'failed' || job.status === 'completed') job = await this.to(job, 'processing');
     await setActiveJobId(job.id);
@@ -198,6 +235,19 @@ export class Engine {
     job = await this.to(job, 'waiting');
     await setActiveJobId(job.id);
     await this.resend(job, '用户确认远端未收到请求', true);
+  }
+
+  /** 用户已在 Provider 网页端手工点击继续生成；这里只读确认结果，不代替用户点击。 */
+  async manualContinue(jobId: string): Promise<void> {
+    let job = await getJob(jobId);
+    if (!job?.current || !isActive(job.status) || !job.current.rateLimited) return;
+    job = {
+      ...job,
+      current: { ...job.current, manualIntervention: true, continuationProbeAt: undefined },
+      lastError: null,
+    };
+    await saveJob(appendJobEvent(job, 'manual-intervention', '用户确认已手工继续生成，开始只读确认'));
+    await this.reconcile(job, 'manual intervention');
   }
 
   /** 删除本任务创建的 Provider 网页会话，但保留本地任务与提炼结果。 */
@@ -245,9 +295,22 @@ export class Engine {
   async onAlarm(name: string): Promise<void> {
     const match = /^lcw:([tr]):(.+)$/.exec(name);
     if (!match?.[2]) return;
-    const job = await getJob(match[2]);
+    let job = await getJob(match[2]);
     if (!job || !isActive(job.status)) return;
+    if (job.sessionCooldownUntil != null) {
+      if (job.sessionCooldownUntil > Date.now()) {
+        this.host.scheduleAlarm(RESUME_ALARM(job.id), job.sessionCooldownUntil);
+        // 官方冷却期间不自动检查，也不自动点击“继续生成”；用户可通过界面按钮触发一次只读确认。
+        return;
+      }
+      job = { ...job, sessionCooldownUntil: undefined, sessionCooldownStartedAt: undefined, sessionCooldownReason: undefined };
+      await saveJob(job);
+    }
     if (job.current?.rateLimited) {
+      if (job.current.manualIntervention) {
+        await this.reconcile(job, 'manual intervention after cooldown');
+        return;
+      }
       const retryAfterAt = job.current.retryAfterAt ?? Date.now() + LEGACY_RATE_LIMIT_GRACE_MS;
       if (!job.current.retryAfterAt) {
         await saveJob({ ...job, current: { ...job.current, retryAfterAt } });
@@ -277,29 +340,49 @@ export class Engine {
     const job = await this.activeJob();
     if (!job || !job.current || job.providerConnectionId !== connectionId) return;
     if (job.status !== 'waiting' && job.status !== 'paused') return;
+    const observed = appendJobEvent(job, 'generation-end', `${job.current.kind}/${job.current.ref} 收到 Provider 生成结束事件`);
+    await saveJob(observed);
+    if (job.current.rateLimited && !job.current.manualIntervention) {
+      // 限流期间的手工操作必须由用户点击“我已手工继续生成”确认后才对账。
+      this.host.scheduleAlarm(RESUME_ALARM(job.id), job.current.retryAfterAt ?? Date.now() + LEGACY_RATE_LIMIT_GRACE_MS);
+      return;
+    }
     if (job.config.deepThinking) {
       this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + DEEP_THINKING_SETTLE_MS);
     } else {
-      await this.reconcile(job, 'generation end');
+      await this.reconcile(observed, 'generation end');
     }
   }
 
-  async onRateLimited(connectionId: string, detail: string, retryAfterMs?: number): Promise<void> {
-    let job = await this.activeJob();
-    if (!job || !job.current || job.providerConnectionId !== connectionId) return;
-    if (job.current.rateLimited) return;
-    const retryDelay = this.retryDelay(retryAfterMs);
-    job = { ...job, current: { ...job.current, rateLimited: true, retryAfterAt: Date.now() + retryDelay },
-      stats: { ...job.stats, rateLimitHits: job.stats.rateLimitHits + 1 }, lastError: detail };
-    await saveJob(job);
-    this.host.clearAlarm(TIMEOUT_ALARM(job.id));
-    this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + retryDelay);
+  /** 由用户选择当前有效会话后重跑；历史结果只读保留，后续阶段按依赖自动重建。 */
+  async reprocessResults(jobId: string, resultIds: string[]): Promise<void> {
+    const activeId = await getActiveJobId();
+    if (activeId && activeId !== jobId) {
+      const other = await getJob(activeId);
+      if (other && isActive(other.status)) throw new Error('已有进行中的任务，请先暂停或取消');
+    }
+    const job = await this.mustGet(jobId);
+    const metas = await chunkMetasByJob(jobId);
+    const records = await resultsByJob(jobId);
+    const plan = planReprocess(job, metas, records, resultIds);
+    const transitioned = transitionJob(plan.job, plan.nextStatus, Date.now());
+    await commitReprocessPlan(transitioned, plan.changedChunks);
+    await setActiveJobId(jobId);
+    const next = await getJob(jobId);
+    if (next) await this.pump(next.id);
+  }
+
+
+  async onRateLimited(connectionId: string, detail: string, retryAfterMs?: number, continuationRetryAfterMs?: number): Promise<void> {
+    const job = await this.activeJob();
+    if (!job || job.providerConnectionId !== connectionId) return;
+    await this.noteRateLimit(job, detail, retryAfterMs, continuationRetryAfterMs);
   }
 
   async onAdapterError(connectionId: string, detail: string): Promise<void> {
     const job = await this.activeJob();
     if (!job || job.providerConnectionId !== connectionId) return;
-    await saveJob({ ...job, lastError: detail });
+    await saveJob(appendJobEvent({ ...job, lastError: detail }, 'provider-error', detail));
     this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + RETRY_DELAY_MS);
   }
 
@@ -339,6 +422,9 @@ export class Engine {
   }
 
   private async dispatchNextChunkStage(job: Job): Promise<void> {
+    if (job.config.taskKind === 'knowledge' && job.config.pipelineMode === 'staged' && !job.formatPlanResultId) {
+      return this.dispatchInitialFormat(job);
+    }
     const metas = (await chunkMetasByJob(job.id)).sort((a, b) => a.index - b.index);
     // 多阶段流程有全局屏障：必须先为所有分块建立索引，才允许进入目标处理阶段。
     // 否则模型会在索引尚未完整时开始深炼，导致跨块事件无法对齐。
@@ -357,16 +443,55 @@ export class Engine {
     const shouldIndex = job.config.pipelineMode === 'staged' && !meta.indexResultId && meta.stage !== 'process';
     if (shouldIndex) {
       return this.dispatchUnit(job, { kind: 'index', ref: String(meta.index), prevAttempt: meta.attempts },
-        (marker) => buildIndexPrompt(marker, `chunk-${meta.index}`, text, job.config), meta);
+        async (marker) => buildIndexPrompt(marker, `chunk-${meta.index}`, text, await this.promptOptions(job)), meta);
     }
     const indexResult = meta.indexResultId ? await getResult(meta.indexResultId) : undefined;
     if (job.config.pipelineMode === 'staged' && !indexResult) {
       return this.failUnit(job, `chunk ${meta.index} 索引结果缺失`);
     }
     return this.dispatchUnit(job, { kind: 'extract', ref: String(meta.index), prevAttempt: meta.attempts },
-      (marker) => indexResult
-        ? buildDistillationPrompt(marker, text, indexResult.raw, job.config)
-        : buildExtractionPrompt(marker, text, job.config), meta);
+      async (marker) => indexResult
+        ? buildDistillationPrompt(marker, text, indexResult.raw, await this.promptOptions(job))
+        : buildExtractionPrompt(marker, text, await this.promptOptions(job)), meta);
+  }
+
+  /** 在首次索引/提炼前，先让 Provider 根据任务目标和少量原文样本给出格式规范。 */
+  private async dispatchInitialFormat(job: Job): Promise<void> {
+    const samples = await this.loadChunkSamples(job.id);
+    if (samples.length === 0) return this.failJob(job, '没有可用于生成格式规范的原文分块');
+    const matched = job.current?.kind === 'format' && job.current.ref === 'preflight' ? job.current : null;
+    const prevAttempt = Math.max(0, (matched?.attempt ?? 0) - (matched?.rateLimited ? 1 : 0));
+    return this.dispatchUnit(job, { kind: 'format', ref: 'preflight', prevAttempt },
+      async (marker) => buildFormatPlanPrompt(marker, samples, await this.promptOptions(job)));
+  }
+
+  private async loadChunkSamples(jobId: string): Promise<string[]> {
+    const metas = (await chunkMetasByJob(jobId)).sort((left, right) => left.index - right.index).slice(0, 3);
+    const samples: string[] = [];
+    for (const meta of metas) {
+      const text = await getChunkTextById(meta.id);
+      if (text != null && text.trim()) samples.push(text.slice(0, 4_000));
+    }
+    return samples;
+  }
+
+  private async promptOptions(job: Job) {
+    const planId = job.formatState?.planResultId ?? job.formatPlanResultId;
+    const plan = planId ? await getResult(planId) : undefined;
+    return { ...job.config, formatPlan: plan?.raw };
+  }
+
+  private async parseTaskResult(job: Job, raw: string): Promise<ResultPayload | null> {
+    if (job.config.taskKind === 'custom') return raw.trim() || null;
+    const planId = job.formatState?.planResultId ?? job.formatPlanResultId;
+    if (planId) {
+      const planResult = await getResult(planId);
+      if (planResult && isFormatPlan(planResult.parsed) && planResult.parsed.output?.mode === 'json') {
+        const parsed = parseJsonResult(raw);
+        return parsed ? sanitizeJsonResult(parsed) : null;
+      }
+    }
+    return sanitizeExtraction(raw);
   }
 
   private async dispatchNextReduce(job: Job): Promise<void> {
@@ -376,12 +501,22 @@ export class Engine {
         const prevAttempt = Math.max(0, (matched?.attempt ?? 0) - (matched?.rateLimited ? 1 : 0));
         const samples = await this.loadFormatSamples(job.formatState.inputIds);
         return this.dispatchUnit(job, { kind: 'format', ref: 'plan', prevAttempt },
-          (marker) => buildFormatPlanPrompt(marker, samples, job.config));
+          async (marker) => buildFormatPlanPrompt(marker, samples, await this.promptOptions(job)));
       }
       if (job.formatState.phase === 'normalizing') {
         const state = job.formatState;
         if (!state.planResultId) return this.failJob(job, '动态格式规范缺失');
         if (state.nextGroup >= state.groups.length) return this.finishFormatNormalization(job);
+        const reused = state.reusedOutputIds?.[state.nextGroup];
+        if (reused) {
+          const advanced: FormatState = {
+            ...state,
+            nextGroup: state.nextGroup + 1,
+            outputIds: [...state.outputIds, reused],
+          };
+          await saveJob({ ...job, formatState: advanced });
+          return this.dispatchNextReduce({ ...job, formatState: advanced });
+        }
         const group = state.groups[state.nextGroup];
         if (!group) return this.failJob(job, `格式统一分组缺失: ${state.nextGroup}`);
         const plan = await getResult(state.planResultId);
@@ -391,11 +526,11 @@ export class Engine {
         const matched = job.current?.kind === 'normalize' && job.current.ref === ref ? job.current : null;
         const prevAttempt = Math.max(0, (matched?.attempt ?? 0) - (matched?.rateLimited ? 1 : 0));
         return this.dispatchUnit(job, { kind: 'normalize', ref, prevAttempt },
-          (marker) => buildNormalizePrompt(
+          async (marker) => buildNormalizePrompt(
             marker,
             plan.raw,
             results.map((result) => JSON.stringify(result.parsed)),
-            job.config,
+            await this.promptOptions(job),
           ));
       }
     }
@@ -418,6 +553,12 @@ export class Engine {
     const groupIndex = state.nextGroup;
     const group = state.groups[groupIndex];
     if (!group) return this.failJob(job, `归并分组缺失: ${groupIndex}`);
+    const reused = state.reusedOutputIds?.[groupIndex];
+    if (reused) {
+      const advanced = { ...state, nextGroup: state.nextGroup + 1, outputIds: [...state.outputIds, reused] };
+      await saveJob({ ...job, reduceState: advanced });
+      return this.dispatchNextReduce({ ...job, reduceState: advanced });
+    }
     const ids = state.inputIds.slice(group.start, group.end);
     const results = await this.loadResults(ids);
     if (results.length !== ids.length) return this.failJob(job, `归并输入缺失: level ${state.level} group ${groupIndex}`);
@@ -425,17 +566,19 @@ export class Engine {
     const matched = job.current?.kind === 'reduce' && job.current.ref === ref ? job.current : null;
     const prevAttempt = Math.max(0, (matched?.attempt ?? 0) - (matched?.rateLimited ? 1 : 0));
     return this.dispatchUnit(job, { kind: 'reduce', ref, prevAttempt },
-      (marker) => buildReducePrompt(marker, results.map((r) => r.raw), job.config, state.groups.length === 1));
+      async (marker) => buildReducePrompt(marker, results.map((r) => r.raw), await this.promptOptions(job), state.groups.length === 1));
   }
 
   private async loadFormatSamples(inputIds: string[]): Promise<string[]> {
     const results = await this.loadResults(inputIds);
     return results.map((result) => {
-      if (isExtractionResult(result.parsed)) {
-        return JSON.stringify({
-          knowledge: result.parsed.knowledge.slice(0, 4),
-          ...(result.parsed.people ? { people: result.parsed.people.slice(0, 4) } : {}),
-        });
+      if (isJsonResult(result.parsed)) {
+        return JSON.stringify(isExtractionResult(result.parsed)
+          ? {
+              knowledge: result.parsed.knowledge.slice(0, 4),
+              ...(result.parsed.people ? { people: result.parsed.people.slice(0, 4) } : {}),
+            }
+          : result.parsed);
       }
       return result.raw.slice(0, 4_000);
     });
@@ -477,7 +620,10 @@ export class Engine {
     makePrompt: (marker: string) => string | Promise<string>,
     meta?: ChunkMeta,
   ): Promise<void> {
-    const attempt = unit.prevAttempt + 1;
+    const attempt = Math.max(
+      unit.prevAttempt + 1,
+      (job.reprocessAttemptBases?.[`${unit.kind}:${unit.ref}`] ?? -1) + 1,
+    );
     const marker = formatMarker({ jobShort: job.shortId, kind: unit.kind, ref: unit.ref, attempt });
     const current: CurrentUnit = {
       kind: unit.kind,
@@ -495,7 +641,11 @@ export class Engine {
     await sleep(job.config.sendDelayMs);
     let fresh = await getJob(job.id);
     if (!fresh || fresh.status === 'paused' || fresh.status === 'canceled' || fresh.current?.marker !== marker) return;
-    await this.submitPrepared(fresh, await makePrompt(marker), meta);
+    const basePrompt = await makePrompt(marker);
+    const prompt = attempt > 1
+      ? `${basePrompt}\n\n【重试纠偏】\n上一次回复被程序判定为无实际内容或不可用。请重新核对原始输入和用户目标，提取确实存在的依据；不要再次返回空对象、空数组或仅包含空数组的结果。除非原文确实没有任何相关信息，否则至少输出一条有具体内容的结果。`
+      : basePrompt;
+    await this.submitPrepared(fresh, prompt, meta);
   }
 
   private async submitPrepared(job: Job, prompt: string, meta?: ChunkMeta): Promise<void> {
@@ -503,11 +653,16 @@ export class Engine {
     if (!current || current.phase !== 'prepared') return;
     const marker = current.marker;
     try {
+      const pacedJob = { ...job, current: { ...current, inputChars: prompt.length } };
+      if (await this.deferForProviderCooldown(pacedJob, prompt.length)) return;
       const connectionId = await this.ensureConnection(job);
-      await this.host.prepare(connectionId, current);
+      const preparation = await this.host.prepare(connectionId, current);
+      if (preparation?.status === 'retry_current') {
+        return this.retryMissingRemoteSession(job, preparation);
+      }
       const fresh = await getJob(job.id);
       if (!fresh || fresh.status === 'paused' || fresh.status === 'canceled' || fresh.current?.marker !== marker) return;
-      job = { ...fresh, current: { ...current, phase: 'submitting' }, providerConnectionId: connectionId };
+      job = { ...fresh, current: { ...fresh.current!, phase: 'submitting', inputChars: prompt.length }, providerConnectionId: connectionId };
       await saveJob(job);
       const outcome = await this.host.submit(connectionId, marker, prompt);
       if (outcome.status === 'accepted') {
@@ -518,7 +673,7 @@ export class Engine {
         this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + this.reconcileDelay(job, FIRST_RECONCILE_MS));
         this.host.scheduleAlarm(TIMEOUT_ALARM(job.id), Date.now() + job.config.generationTimeoutMs);
       } else if (outcome.status === 'rate_limited') {
-        await this.noteRateLimit(job, outcome.detail, outcome.retryAfterMs);
+        await this.noteRateLimit(job, outcome.detail, outcome.retryAfterMs, outcome.continuationRetryAfterMs);
       } else if (outcome.status === 'retryable') {
         await this.scheduleSafeRetry(job, outcome.detail, outcome.retryAfterMs);
       } else if (outcome.status === 'rejected') {
@@ -539,24 +694,69 @@ export class Engine {
     this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + Math.max(RETRY_DELAY_MS, retryAfterMs));
   }
 
+  /** Provider 在已生成提示、尚未创建网页会话前要求主动冷却。 */
+  private async deferForProviderCooldown(job: Job, inputChars: number): Promise<boolean> {
+    const now = Date.now();
+    const advice = await this.host.getDispatchCooldown?.(job, inputChars, now);
+    if (!advice || advice.until <= now || !job.current) return false;
+    const until = Math.max(now + RETRY_DELAY_MS, advice.until);
+    let waiting: Job = {
+      ...job,
+      current: { ...job.current, inputChars },
+      sessionCooldownUntil: until,
+      sessionCooldownStartedAt: now,
+      sessionCooldownReason: advice.detail,
+      lastError: null,
+    };
+    await saveJob(waiting);
+    this.host.log('Provider 主动冷却', {
+      jobId: waiting.shortId,
+      at: new Date(now).toISOString(),
+      until: new Date(until).toISOString(),
+      inputChars,
+      reason: advice.detail,
+    });
+    if (waiting.status !== 'waiting' && waiting.status !== 'paused') waiting = await this.to(waiting, 'waiting');
+    this.host.clearAlarm(TIMEOUT_ALARM(waiting.id));
+    this.host.scheduleAlarm(RESUME_ALARM(waiting.id), until);
+    return true;
+  }
+
   private async ensureConnection(job: Job): Promise<string> {
-    if (job.providerConnectionId) return job.providerConnectionId;
+    // 持久化的连接 ID 可能指向已关闭的标签页。交由 Provider 验证并重新绑定，
+    // 避免对账一直使用失效 ID 反复报错。
     const id = await this.host.connect(job);
-    await saveJob({ ...job, providerConnectionId: id });
+    if (id !== job.providerConnectionId) await saveJob({ ...job, providerConnectionId: id });
     return id;
   }
 
   private async reconcile(job: Job, why: string): Promise<void> {
     if (job.status === 'paused' || !job.current) return;
-    if (job.current.phase === 'prepared') return this.resumePrepared(job);
+    const rateLimited = job.current.rateLimited === true;
+    const retryAfterAt = job.current.retryAfterAt ?? Date.now() + LEGACY_RATE_LIMIT_GRACE_MS;
+    if (rateLimited && !job.current.retryAfterAt) {
+      job = { ...job, current: { ...job.current, retryAfterAt } };
+      await saveJob(job);
+    }
+    if (rateLimited && retryAfterAt <= Date.now()) return this.resend(job, 'Provider 限流退避结束');
     const unit = job.current;
+    if (!unit) return;
+    if (unit.phase === 'prepared') return this.resumePrepared(job);
     try {
       const connectionId = await this.ensureConnection(job);
       if (connectionId !== job.providerConnectionId) {
         job = { ...job, providerConnectionId: connectionId };
         await saveJob(job);
       }
-      await this.host.prepare(connectionId, unit);
+      const preparation = await this.host.prepare(connectionId, unit);
+      if (preparation?.status === 'retry_current') {
+        if (rateLimited && retryAfterAt > Date.now()) {
+          await saveJob({ ...job, lastError: preparation.detail });
+          this.host.scheduleAlarm(RESUME_ALARM(job.id), retryAfterAt);
+          return;
+        }
+        return this.retryMissingRemoteSession(job, preparation);
+      }
       await this.handleInspection(job, await this.host.inspect(connectionId, unit), why);
     } catch (error) {
       await saveJob({ ...job, lastError: `Provider 暂不可用: ${errMsg(error)}` });
@@ -575,11 +775,18 @@ export class Engine {
       return this.submitPrepared(job, await this.buildChunkPrompt(job, unit, meta, text), meta);
     }
     if (unit.kind === 'format') {
+      if (unit.ref === 'preflight') {
+        return this.submitPrepared(job, buildFormatPlanPrompt(
+          unit.marker,
+          await this.loadChunkSamples(job.id),
+          await this.promptOptions(job),
+        ));
+      }
       if (!job.formatState) return this.failJob(job, '动态格式规范状态缺失');
       return this.submitPrepared(job, buildFormatPlanPrompt(
         unit.marker,
         await this.loadFormatSamples(job.formatState.inputIds),
-        job.config,
+        await this.promptOptions(job),
       ));
     }
     if (unit.kind === 'normalize') {
@@ -594,7 +801,7 @@ export class Engine {
         unit.marker,
         plan.raw,
         results.map((result) => JSON.stringify(result.parsed)),
-        job.config,
+        await this.promptOptions(job),
       ));
     }
     const state = job.reduceState;
@@ -605,7 +812,7 @@ export class Engine {
     return this.submitPrepared(job, buildReducePrompt(
       unit.marker,
       results.map((result) => result.raw),
-      job.config,
+      await this.promptOptions(job),
       state.groups.length === 1,
     ));
   }
@@ -632,8 +839,16 @@ export class Engine {
           return;
         }
       }
+      job = appendJobEvent(job, 'inspection-complete', `${current.kind}/${current.ref} 已检测到完整回复${why ? `（${why}）` : ''}`);
       const collecting = job.status === 'waiting' ? await this.to(job, 'collecting') : job;
       await this.collectCurrent(collecting, inspection.reply);
+    } else if (inspection.status === 'retry_current') {
+      if (current.rateLimited && (current.retryAfterAt ?? 0) > Date.now()) {
+        await saveJob({ ...job, lastError: inspection.detail });
+        this.host.scheduleAlarm(RESUME_ALARM(job.id), current.retryAfterAt!);
+        return;
+      }
+      await this.retryMissingRemoteSession(job, inspection);
     } else if (inspection.status === 'generating') {
       if (current.completionObservedAt || job.lastError) {
         job = { ...job, lastError: null, current: { ...current, completionObservedAt: undefined } };
@@ -641,11 +856,33 @@ export class Engine {
       }
       this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + this.reconcileDelay(job, REGEN_CHECK_MS));
     } else if (inspection.status === 'rate_limited') {
-      await this.noteRateLimit(job, inspection.detail, inspection.retryAfterMs);
+      if (current.rateLimited) {
+        this.host.scheduleAlarm(RESUME_ALARM(job.id), current.retryAfterAt ?? Date.now() + RETRY_DELAY_MS);
+        return;
+      }
+      await this.noteRateLimit(job, inspection.detail, inspection.retryAfterMs, inspection.continuationRetryAfterMs);
     } else if (inspection.status === 'unavailable') {
+      if (current.rateLimited) {
+        // 官方限流期间只做一次自动续写探测。探测失败后不能按 5 秒临时错误间隔
+        // 反复点击“继续生成”，否则会把冷却期变成高频操作并触发更严厉风控。
+        const retryAt = current.retryAfterAt ?? Date.now() + LEGACY_RATE_LIMIT_GRACE_MS;
+        await saveJob({
+          ...job,
+          current: { ...current, continuationProbeAt: undefined },
+          lastError: inspection.detail,
+        });
+        this.host.scheduleAlarm(RESUME_ALARM(job.id), Math.max(Date.now() + RETRY_DELAY_MS, retryAt));
+        return;
+      }
       await saveJob({ ...job, lastError: inspection.detail });
       this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + inspection.retryAfterMs);
     } else if (inspection.status === 'missing') {
+      if (current.rateLimited && current.manualIntervention) {
+        const retryAt = current.retryAfterAt ?? Date.now() + LEGACY_RATE_LIMIT_GRACE_MS;
+        await saveJob({ ...job, lastError: inspection.detail });
+        this.host.scheduleAlarm(RESUME_ALARM(job.id), Math.max(Date.now() + RETRY_DELAY_MS, retryAt));
+        return;
+      }
       // 回复节点可能比生成状态晚挂载，不能把一次短暂 missing 当成失败或触发重发。
       if (why === 'manual recovery') {
         return this.failJob(job, `无法对账(${why})，已停止自动重发以避免重复发送: ${inspection.detail}`, true);
@@ -667,15 +904,92 @@ export class Engine {
     return job.config.deepThinking ? Math.max(normalDelayMs, DEEP_THINKING_RECONCILE_MS) : normalDelayMs;
   }
 
-  private async noteRateLimit(job: Job, detail: string, retryAfterMs?: number): Promise<void> {
+  private async noteRateLimit(job: Job, detail: string, retryAfterMs?: number, _continuationRetryAfterMs?: number): Promise<void> {
+    const now = Date.now();
     if (job.current?.rateLimited) return;
+    if (job.sessionCooldownUntil != null && job.sessionCooldownUntil > now &&
+      job.sessionCooldownReason?.startsWith('Provider 官方限流')) return;
     const retryDelay = this.retryDelay(retryAfterMs);
-    job = { ...job, current: job.current ? { ...job.current, rateLimited: true, retryAfterAt: Date.now() + retryDelay } : null, lastError: detail,
-      stats: { ...job.stats, rateLimitHits: job.stats.rateLimitHits + 1 } };
+    const previousAt = job.rateLimitEvents?.at(-1)?.occurredAt ?? 0;
+    const history = job.trafficHistory ?? [];
+    const submittedSamples = history.filter((sample) => sample.submittedAt > previousAt && sample.submittedAt <= now);
+    const completedSamples = history.filter((sample) => {
+      const completedAt = sample.completedAt ?? sample.submittedAt;
+      return completedAt > previousAt && completedAt <= now;
+    });
+    const countedCurrent = job.current && !submittedSamples.some((sample) => sample.marker === job.current?.marker) ? [job.current] : [];
+    const intervalInputChars = submittedSamples.reduce((total, sample) => total + Math.max(0, sample.inputChars), 0)
+      + countedCurrent.reduce((total, unit) => total + Math.max(0, unit.inputChars ?? 0), 0);
+    const intervalOutputChars = completedSamples.reduce((total, sample) => total + Math.max(0, sample.outputChars ?? 0), 0);
+    const previous = job.rateLimitEvents?.at(-1);
+    const cumulativeInputChars = (previous?.cumulativeInputChars ?? previous?.inputChars ?? 0) + intervalInputChars;
+    const cumulativeOutputChars = (previous?.cumulativeOutputChars ?? previous?.outputChars ?? 0) + intervalOutputChars;
+    const event: RateLimitEvent = {
+      occurredAt: now,
+      sentCount: job.stats.sent,
+      providerSessionCount: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs.length : 0,
+      // inputChars/outputChars 保留为兼容字段，语义等同本次事件之间的新增量。
+      inputChars: intervalInputChars,
+      outputChars: intervalOutputChars,
+      intervalInputChars,
+      intervalOutputChars,
+      cumulativeInputChars,
+      cumulativeOutputChars,
+      retryAfterMs: retryDelay,
+      detail,
+    };
+    const rateLimitEvents = [...(job.rateLimitEvents ?? []), event].slice(-RATE_LIMIT_EVENT_HISTORY_LIMIT);
+    const retryAfterAt = now + retryDelay;
+    const existingCooldown = job.sessionCooldownUntil ?? 0;
+    job = appendJobEvent({
+      ...job,
+      current: job.current ? {
+        ...job.current,
+        rateLimited: true,
+        retryAfterAt,
+        continuationProbeAt: undefined,
+      } : null,
+      // 限流也要落到任务级冷却，覆盖当前单元为空、暂停后继续和扩展重载恢复。
+      sessionCooldownUntil: Math.max(existingCooldown, retryAfterAt),
+      sessionCooldownStartedAt: now,
+      sessionCooldownReason: `Provider 官方限流，${Math.ceil(retryDelay / 60_000)} 分钟后重试`,
+      rateLimitEvents,
+      lastError: detail,
+      stats: { ...job.stats, rateLimitHits: job.stats.rateLimitHits + 1 },
+    }, 'rate-limit', detail);
+    this.host.log('Provider 官方限流', {
+      jobId: job.shortId,
+      at: new Date(now).toISOString(),
+      sentCount: event.sentCount,
+      providerSessionCount: event.providerSessionCount,
+      intervalInputChars: event.intervalInputChars,
+      intervalOutputChars: event.intervalOutputChars,
+      cumulativeInputChars: event.cumulativeInputChars,
+      cumulativeOutputChars: event.cumulativeOutputChars,
+      retryAfterMs: event.retryAfterMs,
+    });
     await saveJob(job);
     if (job.status !== 'waiting' && job.status !== 'paused') job = await this.to(job, 'waiting');
     this.host.clearAlarm(TIMEOUT_ALARM(job.id));
-    this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + retryDelay);
+    this.host.scheduleAlarm(RESUME_ALARM(job.id), retryAfterAt);
+  }
+
+  /** Provider 已确认原远端会话被删除或不可恢复；递增 attempt 后在新会话重发。 */
+  private async retryMissingRemoteSession(job: Job, preparation: Extract<ProviderPrepareOutcome, { status: 'retry_current' }>): Promise<void> {
+    if (!job.current) return;
+    const recovered: Job = {
+      ...job,
+      current: {
+        ...job.current,
+        phase: 'prepared',
+        remoteRef: null,
+        rateLimited: undefined,
+        retryAfterAt: undefined,
+      },
+      lastError: preparation.detail,
+    };
+    await saveJob(recovered);
+    await this.resend(recovered, preparation.detail, true);
   }
 
   private async resend(job: Job, reason: string, force = false): Promise<void> {
@@ -692,10 +1006,15 @@ export class Engine {
         (marker) => this.buildChunkPrompt(job, { ...unit, marker }, meta, text), meta);
     }
     if (unit.kind === 'format') {
+      if (unit.ref === 'preflight') {
+        const samples = await this.loadChunkSamples(job.id);
+        return this.dispatchUnit(job, { kind: 'format', ref: 'preflight', prevAttempt },
+          async (marker) => buildFormatPlanPrompt(marker, samples, await this.promptOptions(job)));
+      }
       if (!job.formatState) return this.failJob(job, '动态格式规范状态缺失');
       const samples = await this.loadFormatSamples(job.formatState.inputIds);
       return this.dispatchUnit(job, { kind: 'format', ref: 'plan', prevAttempt },
-        (marker) => buildFormatPlanPrompt(marker, samples, job.config));
+        async (marker) => buildFormatPlanPrompt(marker, samples, await this.promptOptions(job)));
     }
     if (unit.kind === 'normalize') {
       const state = job.formatState;
@@ -707,23 +1026,24 @@ export class Engine {
       const results = await this.loadResults(state.inputIds.slice(group.start, group.end));
       if (results.length !== group.end - group.start) return this.failJob(job, '格式统一分组输入缺失');
       return this.dispatchUnit(job, { kind: 'normalize', ref: unit.ref, prevAttempt },
-        (marker) => buildNormalizePrompt(marker, plan.raw, results.map((r) => JSON.stringify(r.parsed)), job.config));
+        async (marker) => buildNormalizePrompt(marker, plan.raw, results.map((r) => JSON.stringify(r.parsed)), await this.promptOptions(job)));
     }
     const state = job.reduceState;
     const group = state?.groups[state.nextGroup];
     if (!state || !group) return this.failJob(job, '归并状态缺失');
     const results = await this.loadResults(state.inputIds.slice(group.start, group.end));
     return this.dispatchUnit(job, { kind: 'reduce', ref: unit.ref, prevAttempt },
-      (marker) => buildReducePrompt(marker, results.map((r) => r.raw), job.config, state.groups.length === 1));
+      async (marker) => buildReducePrompt(marker, results.map((r) => r.raw), await this.promptOptions(job), state.groups.length === 1));
   }
 
   private async buildChunkPrompt(job: Job, unit: CurrentUnit, meta: ChunkMeta, text: string): Promise<string> {
-    if (unit.kind === 'index') return buildIndexPrompt(unit.marker, `chunk-${meta.index}`, text, job.config);
-    if (job.config.pipelineMode !== 'staged') return buildExtractionPrompt(unit.marker, text, job.config);
+    const options = await this.promptOptions(job);
+    if (unit.kind === 'index') return buildIndexPrompt(unit.marker, `chunk-${meta.index}`, text, options);
+    if (job.config.pipelineMode !== 'staged') return buildExtractionPrompt(unit.marker, text, options);
     if (!meta.indexResultId) throw new Error(`chunk ${meta.index} 索引结果缺失`);
     const indexResult = await getResult(meta.indexResultId);
     if (!indexResult) throw new Error(`chunk ${meta.index} 索引结果记录缺失`);
-    return buildDistillationPrompt(unit.marker, text, indexResult.raw, job.config);
+    return buildDistillationPrompt(unit.marker, text, indexResult.raw, options);
   }
 
   private async collectCurrent(job: Job, raw: string): Promise<void> {
@@ -733,8 +1053,15 @@ export class Engine {
       ? parseIndexResult(raw)
       : unit.kind === 'format'
         ? parseFormatPlan(raw)
-        : job.config.taskKind === 'custom' ? (raw.trim() || null) : sanitizeExtraction(raw);
-    if (!parsed) return this.resend(job, '回复结构异常，自动重新生成');
+        : await this.parseTaskResult(job, raw);
+    if (!parsed || (
+      unit.kind !== 'index'
+      && unit.kind !== 'format'
+      && !hasMeaningfulPayload(parsed)
+    )) {
+      const reason = parsed ? '回复为空或没有实际内容，自动重新生成' : '回复结构异常，自动重新生成';
+      return this.resend(appendJobEvent(job, 'provider-error', `${unit.kind}/${unit.ref} ${reason}（回复 ${raw.trim().length} 字符）`), reason);
+    }
     if (unit.kind === 'index') {
       const index = Number(unit.ref);
       const id = `${job.id}:i${index}:a${unit.attempt}`;
@@ -754,13 +1081,32 @@ export class Engine {
       return;
     }
     if (unit.kind === 'format') {
+      if (unit.ref === 'preflight') {
+        const id = `${job.id}:fpreflight:a${unit.attempt}`;
+        const result: ResultRecord = {
+          id,
+          jobId: job.id,
+          kind: 'format',
+          level: 0,
+          ref: unit.ref,
+          sourceIds: [],
+          raw,
+          parsed,
+          createdAt: Date.now(),
+        };
+        const next = await commitCollected(job.id, unit.marker, result, 'processing', undefined, undefined, undefined, id);
+        if (next) {
+          await this.pump(job.id);
+        }
+        return;
+      }
       const id = `${job.id}:fplan:a${unit.attempt}`;
       const result: ResultRecord = { id, jobId: job.id, kind: 'format', level: 0, ref: unit.ref,
         sourceIds: job.formatState?.inputIds ?? [], raw, parsed, createdAt: Date.now() };
       const formatState = job.formatState
         ? { ...job.formatState, phase: 'normalizing' as const, planResultId: id, nextGroup: 0, outputIds: [] }
         : null;
-      const next = await commitCollected(job.id, unit.marker, result, 'reducing', undefined, undefined, formatState);
+      const next = await commitCollected(job.id, unit.marker, result, 'reducing', undefined, undefined, formatState, id);
       if (next?.status !== 'paused') await this.pump(job.id);
       return;
     }
@@ -803,8 +1149,10 @@ export class Engine {
     if (ids.length === 1) return this.finalize(job, ids[0]!);
     const results = await this.loadResults(ids);
     if (results.length !== ids.length) return this.failJob(job, '提炼结果记录缺失');
-    const hasKnowledge = results.some((result) => isExtractionResult(result.parsed) && result.parsed.knowledge.length > 0);
-    if (job.config.taskKind === 'knowledge' && job.config.formatNormalization !== false && hasKnowledge) {
+    const hasStructuredResults = results.some((result) => isExtractionResult(result.parsed)
+      ? result.parsed.knowledge.length > 0
+      : isJsonResult(result.parsed));
+    if (job.config.taskKind === 'knowledge' && hasStructuredResults) {
       const groups = planGroups(results.map((result) => JSON.stringify(result.parsed).length), {
         fanIn: job.config.fanIn,
         maxChars: job.config.maxChunkChars,
