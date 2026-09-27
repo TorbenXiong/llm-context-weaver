@@ -5,11 +5,12 @@
 import { useCallback, useEffect, useState, type ChangeEvent } from 'react';
 import { splitIntoChunks } from '../core/chunking/chunker';
 import { streamBlobChunks } from '../core/chunking/streamChunker';
-import { recommendJobConfig } from '../core/config/smartDefaults';
-import { fileTestByteLimit, normalizeTestScope, reachedFileTestLimit, selectTestChunks } from '../core/config/testScope';
+import { inferPipelineMode, inferTaskKind, recommendJobConfig } from '../core/config/smartDefaults';
 import { isExtractionResult } from '../core/protocol/schema';
+import { DEFAULT_PROMPT_TEMPLATES } from '../core/protocol/prompts';
 import { renderKnowledgeMarkdown, renderSkillMarkdown } from '../core/protocol/render';
-import { addChunks, appendChunks, createJob, deleteJob, getJob, getResult, jobProgress, listJobs } from '../core/storage/jobStore';
+import { addChunks, appendChunks, chunkMetasByJob, createJob, deleteJob, getJob, getResult, jobProgress, listJobs, resultsByJob, saveJob } from '../core/storage/jobStore';
+import { activeResultIds } from '../core/engine/reprocess';
 import {
   DEFAULT_JOB_CONFIG,
   type Job,
@@ -17,8 +18,8 @@ import {
   type JobProgress,
   type JobStatus,
   type PipelineMode,
+  type PromptTemplateSet,
   type TaskKind,
-  type TestScope,
 } from '../core/types';
 
 const STATUS_LABEL: Record<JobStatus, string> = {
@@ -32,6 +33,21 @@ const STATUS_LABEL: Record<JobStatus, string> = {
   canceled: '已取消',
   failed: '已失败',
 };
+const DISPATCH_PHASE_LABEL: Record<NonNullable<Job['current']>['phase'], string> = {
+  prepared: '准备中',
+  submitting: '提交中',
+  acknowledged: '已确认',
+};
+const EVENT_KIND_LABEL: Record<string, string> = {
+  submitted: '已提交',
+  collected: '已收集',
+  'generation-end': '生成结束',
+  'inspection-complete': '检测完成',
+  'provider-error': '提供方错误',
+  'rate-limit': '官方限流',
+  'manual-intervention': '手工干预',
+};
+const eventKindLabel = (kind: string): string => EVENT_KIND_LABEL[kind] ?? kind;
 const ACTIVE_STATUSES: readonly JobStatus[] = ['split', 'processing', 'waiting', 'collecting', 'reducing'];
 const errMsg = (e: unknown): string => (e instanceof Error ? e.message : String(e));
 
@@ -45,7 +61,11 @@ export function App() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const refresh = useCallback(async () => {
-    setJobs(await listJobs());
+    const nextJobs = await listJobs();
+    setJobs(nextJobs);
+    setSelectedId((current) => current && nextJobs.some((job) => job.id === current)
+      ? current
+      : nextJobs[0]?.id ?? null);
   }, []);
   useEffect(() => {
     void refresh();
@@ -55,8 +75,12 @@ export function App() {
   return (
     <div className="page">
       <header className="page-header">
-        <h1>LLM Context Weaver</h1>
-        <p>超大文本 / 聊天记录 → 分块提炼 → 递归归并 → 结构化知识 · MVP：DeepSeek Web</p>
+        <div className="brand-mark" aria-hidden="true"><span /><span /><span /></div>
+        <div>
+          <h1>LLM Context Weaver</h1>
+          <p>将长文本与聊天记录整理成可复用的结构化结果</p>
+        </div>
+        <span className="provider-label">DeepSeek Web</span>
       </header>
       <NewJobForm
         jobs={jobs}
@@ -67,7 +91,8 @@ export function App() {
       />
       <div className="layout">
         <aside className="job-list">
-          {jobs.length === 0 && <p className="muted">还没有任务。</p>}
+          <h2>任务列表</h2>
+          {jobs.length === 0 && <p className="empty-list">任务开始后会显示在这里</p>}
           {jobs.map((j) => (
             <div key={j.id} className="job-item-row">
               <button className={`job-item ${j.id === selectedId ? 'selected' : ''}`} onClick={() => setSelectedId(j.id)}>
@@ -103,7 +128,10 @@ export function App() {
               }}
             />
           ) : (
-            <p className="muted">选择左侧任务查看详情。</p>
+            <div className="empty-detail">
+              <span className="empty-detail-symbol" aria-hidden="true">→</span>
+              <p>选择任务查看进度与结果</p>
+            </div>
           )}
         </section>
       </div>
@@ -121,13 +149,10 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
   const [generationTimeoutMs, setGenerationTimeoutMs] = useState(DEFAULT_JOB_CONFIG.generationTimeoutMs);
   const [deepThinking, setDeepThinking] = useState(DEFAULT_JOB_CONFIG.deepThinking);
   const [smartSearch, setSmartSearch] = useState(DEFAULT_JOB_CONFIG.smartSearch);
-  const [taskKind, setTaskKind] = useState<TaskKind>(DEFAULT_JOB_CONFIG.taskKind);
-  const [pipelineMode, setPipelineMode] = useState<PipelineMode>(DEFAULT_JOB_CONFIG.pipelineMode);
+  const [taskKindOverride, setTaskKindOverride] = useState<TaskKind | 'auto'>('auto');
+  const [pipelineModeOverride, setPipelineModeOverride] = useState<PipelineMode | 'auto'>('auto');
   const [taskInstruction, setTaskInstruction] = useState(DEFAULT_JOB_CONFIG.taskInstruction);
-  const [testScope, setTestScope] = useState<TestScope>(DEFAULT_JOB_CONFIG.testScope);
-  const [testPercent, setTestPercent] = useState(DEFAULT_JOB_CONFIG.testPercent);
-  const [testSessionLimit, setTestSessionLimit] = useState(DEFAULT_JOB_CONFIG.testSessionLimit);
-  const [formatNormalization, setFormatNormalization] = useState(DEFAULT_JOB_CONFIG.formatNormalization);
+  const [promptTemplates, setPromptTemplates] = useState<PromptTemplateSet>({ ...DEFAULT_PROMPT_TEMPLATES });
   const [deleteProviderSessionsOnComplete, setDeleteProviderSessionsOnComplete] = useState(
     DEFAULT_JOB_CONFIG.deleteProviderSessionsOnComplete,
   );
@@ -137,6 +162,10 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
   const [error, setError] = useState<string | null>(null);
   const inputChars = file?.size ?? text.length;
   const recommendation = recommendJobConfig(inputChars);
+  const taskKind = taskKindOverride === 'auto' ? inferTaskKind(taskInstruction) : taskKindOverride;
+  const pipelineMode = pipelineModeOverride === 'auto'
+    ? inferPipelineMode(taskKind, previewCount ?? 2)
+    : pipelineModeOverride;
 
   useEffect(() => {
     if (!smartTuning || inputChars <= 0) return;
@@ -159,13 +188,13 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
       }
       try {
         const chunks = splitIntoChunks(text, { maxChars: maxChunkChars, hardMaxChars: DEFAULT_JOB_CONFIG.hardMaxChunkChars });
-        setPreviewCount(selectTestChunks(chunks, normalizeTestScope({ testScope, testPercent, testSessionLimit })).length);
+        setPreviewCount(chunks.length);
       } catch {
         setPreviewCount(null);
       }
     }, 300);
     return () => clearTimeout(t);
-  }, [file, text, maxChunkChars, testScope, testPercent, testSessionLimit]);
+  }, [file, text, maxChunkChars]);
 
   const hasActive = jobs.some((j) => ACTIVE_STATUSES.includes(j.status));
 
@@ -182,6 +211,7 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
     setError(null);
     let incompleteJobId: string | null = null;
     try {
+      let actualChunkCount = 0;
       const config: JobConfig = {
         ...DEFAULT_JOB_CONFIG,
         pipelineMode,
@@ -194,28 +224,17 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
         deleteProviderSessionsOnComplete,
         taskKind,
         taskInstruction: taskInstruction.trim(),
-        testScope,
-        testPercent: testScope === 'percent' ? Math.max(1, Math.min(100, Math.floor(testPercent || 100))) : 100,
-        testSessionLimit: testScope === 'sessions' ? Math.max(1, Math.min(100_000, Math.floor(testSessionLimit || 1))) : 0,
-        formatNormalization: taskKind === 'knowledge' && formatNormalization,
+        promptTemplates,
       };
       if (config.taskKind === 'custom' && !config.taskInstruction) throw new Error('自定义处理模式需要填写任务要求');
       const opts = { maxChars: config.maxChunkChars, hardMaxChars: DEFAULT_JOB_CONFIG.hardMaxChunkChars };
-      const scopeConfig = normalizeTestScope(config);
       const job = await createJob(name.trim() || '未命名任务', config, 'deepseek');
       incompleteJobId = job.id;
       if (file) {
         let index = 0;
         let batch: string[] = [];
-        const percentTarget = fileTestByteLimit(file.size, scopeConfig);
-        const encoder = new TextEncoder();
-        let selectedBytes = 0;
-        let selectedCount = 0;
         for await (const chunk of streamBlobChunks(file, opts)) {
-          if (reachedFileTestLimit(selectedBytes, selectedCount, scopeConfig, percentTarget)) break;
           batch.push(chunk);
-          selectedCount++;
-          selectedBytes += encoder.encode(chunk).byteLength;
           if (batch.length >= 100) {
             await appendChunks(job.id, index, batch);
             index += batch.length;
@@ -227,13 +246,21 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
           index += batch.length;
         }
         if (index === 0) throw new Error('分块结果为空');
+        actualChunkCount = index;
       } else {
         if (!text.trim()) throw new Error('请先选择文件或粘贴文本');
         const chunks = splitIntoChunks(text, opts);
         if (chunks.length === 0) throw new Error('分块结果为空');
-        const selectedChunks = selectTestChunks(chunks, scopeConfig);
-        if (selectedChunks.length === 0) throw new Error('测试范围没有选中任何分块');
-        await addChunks(job.id, selectedChunks);
+        await addChunks(job.id, chunks);
+        actualChunkCount = chunks.length;
+      }
+      const resolvedMode = pipelineModeOverride === 'auto'
+        ? inferPipelineMode(config.taskKind, actualChunkCount)
+        : pipelineModeOverride;
+      if (resolvedMode !== config.pipelineMode) {
+        const imported = await getJob(job.id);
+        if (!imported) throw new Error('导入后任务状态缺失');
+        await saveJob({ ...imported, config: { ...imported.config, pipelineMode: resolvedMode } });
       }
       incompleteJobId = null;
       await sendCmd({ channel: 'ui', type: 'start', jobId: job.id });
@@ -250,121 +277,83 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
   }
 
   return (
-    <div className="card">
-      <h2>新建任务</h2>
+    <div className="card compose-card">
       <div className="form-grid">
         <label>
           任务名称
           <input value={name} onChange={(e) => setName(e.target.value)} placeholder="例如：项目群聊天记录 2026" />
         </label>
-        <label>
-          选择文件（.txt / .log / .md / .json）
+      </div>
+
+      <label className="task-instruction">
+        任务要求（核心目标）
+        <textarea
+          value={taskInstruction}
+          onChange={(e) => setTaskInstruction(e.target.value)}
+          placeholder="例如：提取可复用的编程经验；或翻译成英文并保留 Markdown 格式"
+          rows={3}
+        />
+      </label>
+      <details className="prompt-editor">
+        <summary>阶段提示词（可编辑）</summary>
+        <p className="hint">模板只保留通用流程约束；具体任务要求来自上方“任务要求”。可用占位符：<code>{'{{marker}}'}</code>、<code>{'{{task}}'}</code>、<code>{'{{input}}'}</code>、<code>{'{{index}}'}</code>、<code>{'{{chunkRef}}'}</code>、<code>{'{{samples}}'}</code>、<code>{'{{plan}}'}</code>、<code>{'{{formatPlan}}'}</code>、<code>{'{{results}}'}</code>、<code>{'{{stage}}'}</code>、<code>{'{{finalRule}}'}</code>、<code>{'{{format}}'}</code>、<code>{'{{generic}}'}</code>。</p>
+        {([
+          ['index', '目标相关索引'],
+          ['extract', '目标处理 / 分块提取'],
+          ['format', '动态格式规范'],
+          ['normalize', '按规范统一格式'],
+          ['reduce', '中间归并 / 最终交付'],
+        ] as const).map(([key, label]) => (
+          <label key={key}>
+            {label}
+            <textarea
+              rows={8}
+              value={promptTemplates[key]}
+              onChange={(e) => setPromptTemplates((current) => ({ ...current, [key]: e.target.value }))}
+            />
+          </label>
+        ))}
+        <button type="button" onClick={() => setPromptTemplates({ ...DEFAULT_PROMPT_TEMPLATES })}>恢复通用模板</button>
+      </details>
+      <div className="source-section">
+        <label className="file-source">
+          <span className="source-label-row"><span>选择文件</span><small>支持 .txt、.log、.md、.json</small></span>
           <input type="file" accept=".txt,.log,.md,.json,text/plain,application/json" onChange={(e) => void onFileChange(e)} />
         </label>
-      </div>
-      <div className="form-grid">
-        <label>
-          任务类型
-          <select value={taskKind} onChange={(e) => setTaskKind(e.target.value as TaskKind)}>
-            <option value="knowledge">结构化知识提取</option>
-            <option value="custom">自定义文本处理</option>
-          </select>
-        </label>
-        <label>
-          处理流程
-          <select value={pipelineMode} onChange={(e) => setPipelineMode(e.target.value as PipelineMode)}>
-            <option value="staged">多阶段：相关索引 → 目标处理 → 归并</option>
-            <option value="direct">直接处理：分块处理 → 归并</option>
-          </select>
-          <small className="hint">大文件和知识提取推荐多阶段；翻译、改写等线性任务可用直接处理。</small>
-        </label>
-        <label>
-          任务要求（核心目标）
-          <textarea
-            value={taskInstruction}
-            onChange={(e) => setTaskInstruction(e.target.value)}
-            placeholder={taskKind === 'custom' ? '例如：翻译成英文，并保留 Markdown 格式' : '例如：提取可复用的编程知识，不要收录闲聊'}
-            rows={2}
-          />
-          <small className="hint">模型优先执行这里的要求；任务类型只决定结果格式。</small>
-        </label>
-      </div>
-      {file ? (
-        <p className="muted">已选择文件：{file.name}（{file.size.toLocaleString()} 字节，开始时流式导入）</p>
-      ) : (
-        <textarea
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          placeholder="或直接粘贴聊天记录文本（大文件请用上方文件选择）…"
-          rows={6}
-        />
-      )}
-      <div className="test-scope card-inset">
-        <div className="form-grid">
-          <label>
-            测试提炼范围
-            <select value={testScope} onChange={(e) => setTestScope(e.target.value as TestScope)}>
-              <option value="all">全部输入</option>
-              <option value="percent">按输入百分比</option>
-              <option value="sessions">最多知识提炼会话数</option>
-            </select>
+        {file ? (
+          <p className="selected-file">已选择文件：<strong>{file.name}</strong>（{file.size.toLocaleString()} 字节，开始时流式导入）</p>
+        ) : (
+          <label className="source-input">
+            粘贴原文
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="直接粘贴需要处理的文本"
+              rows={5}
+            />
           </label>
-          {testScope === 'percent' && (
-            <label>
-              输入百分比（1-100）
-              <input
-                type="number"
-                min={1}
-                max={100}
-                value={testPercent}
-                onChange={(e) => setTestPercent(Number(e.target.value) || 1)}
-              />
-            </label>
-          )}
-          {testScope === 'sessions' && (
-            <label>
-              最多提炼会话数
-              <input
-                type="number"
-                min={1}
-                max={100000}
-                value={testSessionLimit || 1}
-                onChange={(e) => setTestSessionLimit(Number(e.target.value) || 1)}
-              />
-            </label>
-          )}
-        </div>
-        <small className="hint">限制参与知识提炼的原文分块数；归并不计入。多阶段流程每个分块会先索引再处理，设置 3 表示汇总前 3 个分块的知识。</small>
-      </div>
-      <div className="run-options">
-        <label className="toggle-row">
-          <input type="checkbox" checked={deepThinking} onChange={(e) => setDeepThinking(e.target.checked)} />
-          <span>深度思考</span>
-        </label>
-        <label className="toggle-row">
-          <input type="checkbox" checked={smartSearch} onChange={(e) => setSmartSearch(e.target.checked)} />
-          <span>智能搜索</span>
-        </label>
-        <label className="toggle-row">
-          <input
-            type="checkbox"
-            checked={formatNormalization}
-            disabled={taskKind !== 'knowledge'}
-            onChange={(e) => setFormatNormalization(e.target.checked)}
-          />
-          <span>统一格式归档（先生成动态规范，再分批统一）</span>
-        </label>
-        <label className="toggle-row warning-row">
-          <input
-            type="checkbox"
-            checked={deleteProviderSessionsOnComplete}
-            onChange={(e) => setDeleteProviderSessionsOnComplete(e.target.checked)}
-          />
-          <span>完成后自动删除 DeepSeek 网页会话</span>
-        </label>
+        )}
       </div>
       <details>
         <summary>高级参数</summary>
+        <div className="form-grid mode-overrides">
+          <label>
+            结果形式
+            <select value={taskKindOverride} onChange={(e) => setTaskKindOverride(e.target.value as TaskKind | 'auto')}>
+              <option value="auto">自动识别</option>
+              <option value="knowledge">结构化提取</option>
+              <option value="custom">文本处理</option>
+            </select>
+          </label>
+          <label>
+            处理流程
+            <select value={pipelineModeOverride} onChange={(e) => setPipelineModeOverride(e.target.value as PipelineMode | 'auto')}>
+              <option value="auto">自动选择</option>
+              <option value="staged">多阶段处理</option>
+              <option value="direct">直接处理</option>
+            </select>
+          </label>
+        </div>
         <label className="toggle-row">
           <input type="checkbox" checked={smartTuning} onChange={(e) => setSmartTuning(e.target.checked)} />
           <span>智能配置数值参数</span>
@@ -411,12 +400,32 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
           </label>
         </div>
       </details>
-      <div className="actions">
-        <button className="primary" disabled={busy || hasActive || (!file && !text)} onClick={() => void onStart()}>
-          {busy ? '创建/导入中…' : previewCount != null ? `开始任务（${previewCount.toLocaleString()} 块）` : '开始任务'}
-        </button>
-        {hasActive && <span className="muted">已有进行中的任务（MVP 单任务）</span>}
-        {error && <span className="error">{error}</span>}
+      <div className="actions compose-actions">
+        <div className="compose-action-options">
+          <label className="toggle-row">
+            <input type="checkbox" checked={deepThinking} onChange={(e) => setDeepThinking(e.target.checked)} />
+            <span>深度思考</span>
+          </label>
+          <label className="toggle-row">
+            <input type="checkbox" checked={smartSearch} onChange={(e) => setSmartSearch(e.target.checked)} />
+            <span>智能搜索</span>
+          </label>
+          <label className="toggle-row warning-row">
+            <input
+              type="checkbox"
+              checked={deleteProviderSessionsOnComplete}
+              onChange={(e) => setDeleteProviderSessionsOnComplete(e.target.checked)}
+            />
+            <span>完成后自动删除会话</span>
+          </label>
+        </div>
+        <div className="compose-action-end">
+          <button className="primary" disabled={busy || hasActive || (!file && !text)} onClick={() => void onStart()}>
+            {busy ? '创建/导入中…' : previewCount != null ? `开始任务（${previewCount.toLocaleString()} 块）` : '开始任务'}
+          </button>
+          {hasActive && <span className="muted">已有进行中的任务（MVP 单任务）</span>}
+          {error && <span className="error">{error}</span>}
+        </div>
       </div>
     </div>
   );
@@ -425,10 +434,15 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
 function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void }) {
   const [job, setJob] = useState<Job | null>(null);
   const [prog, setProg] = useState<JobProgress | null>(null);
+  const [failedMeta, setFailedMeta] = useState<{ index: number; attempts: number; stage?: string; error: string | null }[]>([]);
+  const [resultMetas, setResultMetas] = useState<import('../core/types').ChunkMeta[]>([]);
+  const [resultRecords, setResultRecords] = useState<import('../core/types').ResultRecord[]>([]);
+  const [selectedResultIds, setSelectedResultIds] = useState<string[]>([]);
   const [finalMd, setFinalMd] = useState<string | null>(null);
   const [finalJson, setFinalJson] = useState<string | null>(null);
   const [finalSkill, setFinalSkill] = useState<string | null>(null);
   const [showResult, setShowResult] = useState(false);
+  const [showLog, setShowLog] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
@@ -436,7 +450,22 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
     setJob(j ?? null);
     if (!j) return;
     setProg(await jobProgress(jobId));
-    if (j.status === 'completed' && j.finalResultId) {
+    const metas = await chunkMetasByJob(jobId);
+    setResultMetas(metas);
+    const records = await resultsByJob(jobId);
+    setResultRecords(records);
+    const activeIds = activeResultIds(j, metas, records);
+    setSelectedResultIds((current) => current.filter((id) => activeIds.has(id)));
+    setFailedMeta(metas
+      .filter((meta) => meta.status === 'failed')
+      .sort((left, right) => left.index - right.index)
+      .map((meta) => ({ index: meta.index, attempts: meta.attempts, stage: meta.stage, error: meta.error })));
+    if (j.status !== 'completed' || !j.finalResultId) {
+      setFinalMd(null);
+      setFinalJson(null);
+      setFinalSkill(null);
+      setShowResult(false);
+    } else {
       const r = await getResult(j.finalResultId);
       if (r) {
         if (typeof r.parsed === 'string') {
@@ -444,8 +473,8 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
           setFinalJson(null);
           setFinalSkill(null);
         } else if (isExtractionResult(r.parsed)) {
-          setFinalMd(renderKnowledgeMarkdown(r.parsed, j.name));
-          setFinalSkill(renderSkillMarkdown(r.parsed, j.name));
+          setFinalMd(renderKnowledgeMarkdown(r.parsed, j.name, j.config.taskInstruction));
+          setFinalSkill(renderSkillMarkdown(r.parsed, j.name, j.config.taskInstruction));
           // version 仅用于内部校验，下载给用户的 JSON 保持固定模板，不额外增加顶层字段。
           const { version: _version, ...publicResult } = r.parsed;
           setFinalJson(JSON.stringify(publicResult, null, 2));
@@ -474,11 +503,62 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
   }
   const active = ACTIVE_STATUSES.includes(job.status);
   const pct = prog && prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0;
+  const now = Date.now();
+  const latestRateLimit = job.rateLimitEvents?.at(-1);
+  const trafficHistory = job.trafficHistory ?? [];
+  const trafficInputSinceRateLimit = trafficHistory.filter((sample) =>
+    !latestRateLimit || sample.submittedAt > latestRateLimit.occurredAt,
+  );
+  const trafficOutputSinceRateLimit = trafficHistory.filter((sample) =>
+    !latestRateLimit || (sample.completedAt ?? sample.submittedAt) > latestRateLimit.occurredAt,
+  );
+  const trafficIntervalInput = trafficInputSinceRateLimit.reduce(
+    (total, sample) => total + Math.max(0, sample.inputChars),
+    0,
+  );
+  const trafficIntervalOutput = trafficOutputSinceRateLimit.reduce(
+    (total, sample) => total + Math.max(0, sample.outputChars ?? 0),
+    0,
+  );
+  const cooldownActive = job.sessionCooldownUntil != null && job.sessionCooldownUntil > now;
+  const officialCooldown = job.sessionCooldownReason?.startsWith('Provider 官方限流') === true;
+  const cooldownStartedAt = cooldownActive
+    ? job.sessionCooldownStartedAt ?? (officialCooldown && latestRateLimit &&
+      latestRateLimit.occurredAt + latestRateLimit.retryAfterMs === job.sessionCooldownUntil
+      ? latestRateLimit.occurredAt : null)
+    : null;
+  const intervalInput = trafficIntervalInput;
+  const intervalOutput = trafficIntervalOutput;
+  const cumulativeInput = (latestRateLimit?.cumulativeInputChars
+    ?? latestRateLimit?.inputChars
+    ?? 0) + intervalInput;
+  const cumulativeOutput = (latestRateLimit?.cumulativeOutputChars
+    ?? latestRateLimit?.outputChars
+    ?? 0) + intervalOutput;
+  const limitType = officialCooldown ? '官方限流' : '主动限流';
+  const showRateLimitSummary = cooldownActive;
+  const showTrafficSummary = trafficHistory.length > 0 || latestRateLimit != null;
   const run = (cmd: Record<string, unknown>) => {
     setError(null);
     void sendCmd(cmd)
       .then(load)
       .catch((e) => setError(errMsg(e)));
+  };
+  const activeIds = activeResultIds(job, resultMetas, resultRecords);
+  const selectableResults = resultRecords
+    .filter((result) => activeIds.has(result.id))
+    .sort((left, right) => right.createdAt - left.createdAt);
+  const resultKindLabel: Record<string, string> = {
+    index: '索引', extract: '提炼', format: '格式规范', normalize: '格式统一', reduce: '归并',
+  };
+  const resultLooksEmpty = (value: unknown): boolean => {
+    if (typeof value === 'string') return value.trim().length === 0;
+    if (Array.isArray(value)) return value.length === 0 || value.every(resultLooksEmpty);
+    if (value && typeof value === 'object') {
+      const entries = Object.entries(value as Record<string, unknown>);
+      return entries.length === 0 || entries.every(([, item]) => resultLooksEmpty(item));
+    }
+    return value == null;
   };
 
   function download(filename: string, content: string, type: string) {
@@ -491,47 +571,103 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
   }
 
   return (
-    <div className="card">
+    <div className="card detail-card">
       <div className="detail-header">
         <h2>{job.name}</h2>
         <span className={`chip st-${job.status}`}>{STATUS_LABEL[job.status]}</span>
       </div>
       <p className="muted">
-        {job.config.taskKind === 'custom' ? '自定义文本处理' : '结构化知识提取'}
+        {job.config.taskKind === 'custom' ? '文本处理' : '结构化提取'}
         {` · ${job.config.pipelineMode === 'staged' ? '多阶段流程' : '直接流程'}`}
-        {job.config.testScope === 'percent' ? ` · 测试范围 ${job.config.testPercent}%` : ''}
-        {job.config.testScope === 'sessions' ? ` · 测试最多 ${job.config.testSessionLimit} 个提炼会话` : ''}
-        {job.config.taskKind === 'knowledge' && job.config.formatNormalization ? ' · 动态格式归档' : ''}
+        {job.config.taskKind === 'knowledge' ? ' · 动态格式归档' : ''}
         {job.config.taskInstruction ? ` · 要求：${job.config.taskInstruction}` : ''}
       </p>
       <div className="bar">
         <div className="bar-fill" style={{ width: `${pct}%` }} />
       </div>
-      <p className="muted">
-        分块 {prog ? `${prog.done}/${prog.total}` : '…'}
-        {prog && job.config.pipelineMode === 'staged' ? ` · 已建立索引 ${prog.indexed}/${prog.total}` : ''}
-        {prog && prog.failed > 0 ? ` · 失败 ${prog.failed}` : ''}
-        {job.formatState?.phase === 'planning' ? ' · 正在生成动态格式规范' : ''}
-        {job.formatState?.phase === 'normalizing'
-          ? ` · 格式统一（${Math.min(job.formatState.nextGroup + 1, job.formatState.groups.length)}/${job.formatState.groups.length} 批）`
-          : ''}
-        {job.reduceState
-          ? ` · 归并第 ${job.reduceState.level} 层（${Math.min(job.reduceState.nextGroup + 1, job.reduceState.groups.length)}/${job.reduceState.groups.length} 组）`
-          : ''}
-        {` · 已发送总计 ${job.stats.sent} · 已收集总计 ${job.stats.collected} · 限流 ${job.stats.rateLimitHits} 次`}
-        {job.providerSessionRefs.length > 0 ? ` · DeepSeek 网页会话 ${job.providerSessionRefs.length}` : ''}
-        {job.sessionCooldownUntil && job.sessionCooldownUntil > Date.now()
-          ? ` · 主动冷却至 ${new Date(job.sessionCooldownUntil).toLocaleTimeString()}`
-          : ''}
-      </p>
-      {job.current && (
-        <p className="muted">
-          当前单元：<code>{job.current.marker}</code>
-          {` · 阶段 ${job.current.phase}`}
-        </p>
+      <div className="progress-summary">
+        <div className="summary-table-wrap">
+          <table className="summary-table">
+            <tbody>
+              <tr>
+                <th scope="row">进度</th>
+                <td>分块 {prog ? `${prog.done}/${prog.total}` : '…'}</td>
+                {prog && job.config.pipelineMode === 'staged' ? <td>已建立索引 {prog.indexed}/{prog.total}</td> : null}
+                <td>已发送总计 {job.stats.sent}</td>
+                <td>已收集总计 {job.stats.collected}</td>
+                <td>限流 {job.stats.rateLimitHits} 次</td>
+                {job.providerSessionRefs.length > 0 ? <td>DeepSeek 网页会话 {job.providerSessionRefs.length}</td> : null}
+                {prog && prog.failed > 0 ? <td>失败 {prog.failed}</td> : null}
+              </tr>
+              {job.formatState?.phase === 'planning' || job.formatState?.phase === 'normalizing' || job.reduceState ? (
+                <tr>
+                  <th scope="row">阶段</th>
+                  <td colSpan={6}>
+                    {job.formatState?.phase === 'planning' ? '正在生成动态格式规范' : null}
+                    {job.formatState?.phase === 'normalizing'
+                      ? `格式统一（${Math.min(job.formatState.nextGroup + 1, job.formatState.groups.length)}/${job.formatState.groups.length} 批）` : null}
+                    {job.reduceState
+                      ? `归并第 ${job.reduceState.level} 层（${Math.min(job.reduceState.nextGroup + 1, job.reduceState.groups.length)}/${job.reduceState.groups.length} 组）` : null}
+                  </td>
+                </tr>
+              ) : null}
+              {showTrafficSummary ? (
+                <tr>
+                  <th scope="row">流量</th>
+                  <td>本轮输入 {intervalInput.toLocaleString()}</td>
+                  <td>本轮输出 {intervalOutput.toLocaleString()}</td>
+                  <td>累计输入 {cumulativeInput.toLocaleString()}</td>
+                  <td colSpan={3}>累计输出 {cumulativeOutput.toLocaleString()} 字符</td>
+                </tr>
+              ) : null}
+              {showRateLimitSummary ? (
+                <tr>
+                  <th scope="row">限流</th>
+                  <td>限流类型 {limitType ?? '—'}</td>
+                  <td>限流时间 {cooldownStartedAt != null ? new Date(cooldownStartedAt).toLocaleTimeString() : '—'}</td>
+                  <td>重试时间 {cooldownActive && job.sessionCooldownUntil ? new Date(job.sessionCooldownUntil).toLocaleTimeString() : '—'}</td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <>
+        <div className="current-unit-row">
+          {job.current ? <p className="muted">
+            当前单元：<code>{job.current.marker}</code>
+            {` · 阶段 ${DISPATCH_PHASE_LABEL[job.current.phase]}`}
+          </p> : <p className="muted">任务运行日志</p>}
+          <button className="log-button" onClick={() => setShowLog((value) => !value)}>
+            {showLog ? '隐藏日志' : '日志'}
+          </button>
+        </div>
+      </>
+      {showLog && (
+        <div className="job-log" role="log">
+          {(job.eventLog ?? []).length === 0 ? <p className="muted">暂无运行日志</p> : (
+            <ul>
+              {[...(job.eventLog ?? [])].reverse().map((event, index) => (
+                <li key={`${event.at}-${index}`}>
+                  <time>{new Date(event.at).toLocaleString()}</time>
+                  <span>{eventKindLabel(event.kind)}</span>
+                  <em>{event.detail}</em>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
       )}
       {job.status !== 'completed' && job.lastError && <p className="error">最近错误：{job.lastError}</p>}
       <div className="actions">
+        {job.current?.rateLimited && cooldownActive && officialCooldown && (
+          <button
+            className="primary"
+            onClick={() => run({ channel: 'ui', type: 'manualContinue', jobId })}
+          >
+            我已手工继续生成，确认结果
+          </button>
+        )}
         {active && <button onClick={() => run({ channel: 'ui', type: 'pause', jobId })}>暂停</button>}
         {job.status === 'paused' && (
           <button className="primary" onClick={() => run({ channel: 'ui', type: 'resume', jobId })}>
@@ -580,6 +716,33 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
             </button>
           </>
         )}
+        {!active && selectableResults.length > 0 && (
+          <div className="reprocess-panel">
+            <strong>选择会话重新发起</strong>
+            <p className="muted">只选择同一阶段；已选会话的后续阶段会自动重算，历史日志会保留。</p>
+            <div className="reprocess-list">
+              {selectableResults.map((result) => (
+                <label key={result.id} className="reprocess-item">
+                  <input
+                    type="checkbox"
+                    checked={selectedResultIds.includes(result.id)}
+                    onChange={(event) => setSelectedResultIds((current) => event.target.checked
+                      ? [...current, result.id]
+                      : current.filter((id) => id !== result.id))}
+                  />
+                  <span>{resultKindLabel[result.kind] ?? result.kind} / {result.ref} · {result.raw.length.toLocaleString()} 字符{resultLooksEmpty(result.parsed) ? ' · 空内容' : ''}</span>
+                </label>
+              ))}
+            </div>
+            <button
+              className="primary"
+              disabled={selectedResultIds.length === 0}
+              onClick={() => run({ channel: 'ui', type: 'reprocessResults', jobId, resultIds: selectedResultIds })}
+            >
+              重新发起选中会话
+            </button>
+          </div>
+        )}
         {job.status === 'completed' && finalMd && (
           <>
             <button className="primary" onClick={() => setShowResult((v) => !v)}>
@@ -617,6 +780,9 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
             {job.failedChunks.map((i) => (
               <li key={i}>
                 #{i}{' '}
+                {failedMeta.find((meta) => meta.index === i)?.error
+                  ? <span className="muted">（{failedMeta.find((meta) => meta.index === i)?.error}；尝试 {failedMeta.find((meta) => meta.index === i)?.attempts ?? 0} 次）</span>
+                  : null}{' '}
                 <button onClick={() => run({ channel: 'ui', type: 'retryChunk', jobId, index: i })}>重试</button>
               </li>
             ))}

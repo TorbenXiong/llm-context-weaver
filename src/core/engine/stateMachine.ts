@@ -8,7 +8,7 @@ const TRANSITIONS: Record<JobStatus, readonly JobStatus[]> = {
   collecting: ['waiting', 'processing', 'reducing', 'paused', 'completed', 'canceled', 'failed'],
   reducing: ['waiting', 'collecting', 'paused', 'completed', 'canceled', 'failed'],
   paused: ['canceled'],
-  completed: ['processing'], // 完成后补跑失败分块，重新归并覆盖最终结果
+  completed: ['processing', 'reducing'], // 完成后可从选定阶段重跑，并重建受影响的后续结果
   canceled: [],
   // 失败任务可能已持久化到归并/格式归档阶段，恢复时需要继续从 reducing 调度。
   failed: ['processing', 'waiting', 'reducing', 'canceled'],

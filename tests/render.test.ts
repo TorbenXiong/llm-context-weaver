@@ -10,7 +10,7 @@ describe('renderSkillMarkdown', () => {
       content: '连接会间歇性中断。', details: { cause: '网络环路' },
     });
     const skill = renderSkillMarkdown(result, '运维知识');
-    expect(skill).toContain('## 知识条目');
+    expect(skill).toContain('## 提取结果');
     expect(skill).toContain('**运维故障｜ERP连接中断**');
     expect(skill).toContain('连接会间歇性中断。');
     expect(skill).toContain('cause：网络环路');
@@ -54,9 +54,24 @@ describe('renderSkillMarkdown', () => {
     });
     const skill = renderSkillMarkdown(result, 'Atlas 发布知识');
     expect(skill).toContain('name: atlas');
-    expect(skill).toContain('description: "Atlas 发布知识的结构化公司知识');
+    expect(skill).toContain('description: "Atlas 发布知识的结构化结果');
     expect(skill).toContain('## 使用说明');
     expect(skill).toContain('发布流程');
     expect(skill).toContain('需要先完成备份');
+  });
+
+  it('个人成长任务导出的 Markdown 和 Skill 保留原始目标，不预设企业身份', () => {
+    const result: ExtractionResult = {
+      version: EXTRACTION_SCHEMA_VERSION,
+      knowledge: [{
+        category: '沟通方式', topic: '反馈偏好', content: '多次要求先给结论。',
+        details: { 类型: '归纳判断', 依据: '多段对话均明确要求先给结论' },
+      }],
+    };
+    const goal = '提取用户画像与个人成长建议；区分事实与归纳判断';
+    const skill = renderSkillMarkdown(result, '个人成长', goal);
+    expect(skill).toContain(`原任务目标：${goal}`);
+    expect(skill).toContain('依据：多段对话均明确要求先给结论');
+    expect(skill).not.toContain('公司内部知识助手');
   });
 });

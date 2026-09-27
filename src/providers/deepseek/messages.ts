@@ -2,7 +2,7 @@ export interface DeepSeekContinuationResult {
   found: boolean;
   attempted: boolean;
   confirmed: boolean;
-  evidence?: 'button_disappeared' | 'button_disabled' | 'generating' | 'reply_grew' | 'not_confirmed';
+  evidence?: 'button_disappeared' | 'button_disabled' | 'generating' | 'reply_grew' | 'not_confirmed' | 'repeated_tail';
   detail?: string;
 }
 

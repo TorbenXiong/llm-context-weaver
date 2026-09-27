@@ -3,8 +3,9 @@
 export type UiCommand =
   | { channel: 'ui'; type: 'start'; jobId: string }
   | { channel: 'ui'; type: 'pause' | 'resume' | 'cancel' | 'retryFailed'; jobId: string }
-  | { channel: 'ui'; type: 'forceRetryCurrent'; jobId: string }
+  | { channel: 'ui'; type: 'forceRetryCurrent' | 'manualContinue'; jobId: string }
   | { channel: 'ui'; type: 'retryChunk'; jobId: string; index: number }
+  | { channel: 'ui'; type: 'reprocessResults'; jobId: string; resultIds: string[] }
   | { channel: 'ui'; type: 'cleanupSessions'; jobId: string };
 
 export type AdapterEventType =
@@ -21,6 +22,8 @@ export interface AdapterEvent {
   detail?: string;
   /** Provider 建议的下一次重试延迟（毫秒），主要用于限流退避。 */
   retryAfterMs?: number;
+  /** 旧版本兼容字段；当前不会据此安排自动检查。 */
+  continuationRetryAfterMs?: number;
 }
 
 const hasChannel = (m: unknown, channel: string): boolean =>

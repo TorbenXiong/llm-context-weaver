@@ -59,6 +59,44 @@ export const RATE_LIMIT_PATTERNS = [
   /try again later/i,
 ];
 
+/** 通知容器与消息行错误分开识别，避免把用户输入或模型正文当成官方提示。 */
+export const NOTICE_SELECTORS = [
+  '[role="alert"]',
+  '[role="status"]',
+  '[class*="toast" i]',
+  '[class*="notification" i]',
+  '[data-sonner-toast]',
+];
+
+export function isRateLimitNoticeText(text: string): boolean {
+  return RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(text.replace(/\s+/g, ' ').trim()));
+}
+
+/** 发送被拒时，DeepSeek 会把错误放在最新用户消息的正文外，且不赋予 alert/toast 语义。 */
+export function findInlineRateLimitNotice(root: ParentNode = document): string | null {
+  const items = root.querySelectorAll<HTMLElement>('[data-virtual-list-item-key]');
+  const latest = Array.from(items).filter((item) => item.querySelector('.ds-message')).at(-1);
+  if (!latest) return null;
+  for (const node of latest.querySelectorAll<HTMLElement>('span, p, div')) {
+    if (node.children.length > 0 || node.closest('.ds-message') || !node.getClientRects().length) continue;
+    const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+    if (text.length <= 160 && isRateLimitNoticeText(text)) return text;
+  }
+  return null;
+}
+
+export function findRateLimitNotice(root: ParentNode = document): string | null {
+  for (const selector of NOTICE_SELECTORS) {
+    for (const node of root.querySelectorAll<HTMLElement>(selector)) {
+      if (!node.getClientRects().length) continue;
+      // 通知通常很短；长正文即使碰巧使用了相同 class，也不应当作限流。
+      const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (text.length <= 160 && isRateLimitNoticeText(text)) return text;
+    }
+  }
+  return findInlineRateLimitNotice(root);
+}
+
 export function queryFirst(selectors: string[], root: ParentNode = document): Element | null {
   for (const s of selectors) {
     try {
