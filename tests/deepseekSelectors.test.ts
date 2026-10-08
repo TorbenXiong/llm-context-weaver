@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { findRateLimitNotice, isRateLimitNoticeText } from '../src/providers/deepseek/selectors';
+import { findConversationLimitNotice, findRateLimitNotice, isRateLimitNoticeText } from '../src/providers/deepseek/selectors';
 
 const inlineNoticeRoot = (items: Array<{ text: string; inMessage?: boolean; visible?: boolean }>): ParentNode => ({
   querySelectorAll: (selector: string) => selector === '[data-virtual-list-item-key]'
@@ -16,6 +16,13 @@ const inlineNoticeRoot = (items: Array<{ text: string; inMessage?: boolean; visi
 }) as unknown as ParentNode;
 
 describe('DeepSeek 限流提示识别', () => {
+  it('上下文上限只识别最新消息外可见错误，不扫描用户原文和模型引用', () => {
+    const text = '达到对话长度上限，请开启新对话';
+    expect(findConversationLimitNotice(inlineNoticeRoot([{ text }]))).toBe(text);
+    expect(findConversationLimitNotice(inlineNoticeRoot([{ text, inMessage: true }]))).toBeNull();
+    expect(findConversationLimitNotice(inlineNoticeRoot([{ text, visible: false }]))).toBeNull();
+    expect(findConversationLimitNotice(inlineNoticeRoot([{ text }, { text: '新回复' }]))).toBeNull();
+  });
   it('识别截图中的官方提示及常见英文提示', () => {
     expect(isRateLimitNoticeText('消息发送过于频繁，请稍后重试')).toBe(true);
     expect(isRateLimitNoticeText('Too many requests, try again later')).toBe(true);

@@ -27,20 +27,24 @@ export const DEEPSEEK_PROACTIVE_MIN_LEARNABLE_CHARS = 4_000_000;
 export const DEEPSEEK_PROACTIVE_SAFETY_RATIO = 0.75;
 
 export function getDeepSeekDispatchCooldown(
-  job: Pick<Job, 'trafficHistory' | 'rateLimitEvents'>,
+  job: Pick<Job, 'trafficHistory' | 'rateLimitEvents'> & { providerAccountKey?: string },
   inputChars: number,
   now: number,
 ): ProviderDispatchCooldown | null {
   if (!DEEPSEEK_PROACTIVE_COOLDOWN_ENABLED) return null;
+  const belongsToCurrentAccount = (accountKey: string | undefined): boolean =>
+    !job.providerAccountKey || accountKey === job.providerAccountKey;
   const history = (job.trafficHistory ?? [])
-    .filter((sample) => sample.submittedAt > now - DEEPSEEK_PROACTIVE_WINDOW_MS && sample.submittedAt <= now)
+    .filter((sample) => belongsToCurrentAccount(sample.accountKey) &&
+      sample.submittedAt > now - DEEPSEEK_PROACTIVE_WINDOW_MS && sample.submittedAt <= now)
     .sort((left, right) => left.submittedAt - right.submittedAt);
   // 输入额度从提交时开始消耗；输出额度从完整回复收集时开始消耗。
   // 长回复可能跨越数分钟，不能用提交时间把刚产生的输出排除在窗口外。
   const outputHistory = (job.trafficHistory ?? [])
     .filter((sample) => {
       const completedAt = sample.completedAt ?? sample.submittedAt;
-      return completedAt > now - DEEPSEEK_PROACTIVE_WINDOW_MS && completedAt <= now;
+      return belongsToCurrentAccount(sample.accountKey) &&
+        completedAt > now - DEEPSEEK_PROACTIVE_WINDOW_MS && completedAt <= now;
     });
   const latestSubmittedAt = history.at(-1)?.submittedAt;
   const pacedUntil = latestSubmittedAt == null
@@ -50,6 +54,7 @@ export function getDeepSeekDispatchCooldown(
   const priorInput = history.reduce((total, sample) => total + Math.max(0, sample.inputChars), 0);
   const priorOutput = outputHistory.reduce((total, sample) => total + Math.max(0, sample.outputChars ?? 0), 0);
   const observedBudgets = (job.rateLimitEvents ?? [])
+    .filter((event) => belongsToCurrentAccount(event.accountKey))
     .map((event) => event.intervalInputChars ?? event.inputChars ?? 0)
     .filter((total) => total >= DEEPSEEK_PROACTIVE_MIN_LEARNABLE_CHARS);
   const learnedBudget = observedBudgets.length > 0

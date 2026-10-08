@@ -8,19 +8,24 @@
  * "/a/chat/s/<id>"，通过 urlChanged 事件上报给引擎持久化。
  */
 import type { AdapterEvent } from '../../core/messaging';
+import type { ProviderAccountIdentity } from '../../core/provider';
 import type { DeepSeekCommand, DeepSeekContinuationResult } from './messages';
 import {
+  ACCOUNT_LABEL_SELECTORS,
+  ACCOUNT_EXCLUDED_REGIONS,
   INPUT_SELECTORS,
   MARKDOWN_SELECTORS,
   NEW_CHAT_SELECTORS,
   SEND_BUTTON_DISABLED_CLASS,
   SEND_BUTTON_SELECTORS,
   findRateLimitNotice,
+  findConversationLimitNotice,
   isRateLimitNoticeText,
   queryAll,
   queryFirst,
 } from './selectors';
 import { DEEPSEEK_CONTINUATION_PROBE_MS, DEEPSEEK_RATE_LIMIT_RETRY_MS } from './policy';
+export { isDeepSeekConversationLimitText } from './contextLimit';
 
 const TICK_MS = 250;
 const HEARTBEAT_MS = 1_000;
@@ -35,33 +40,105 @@ const MAIN_PROBE_RESPONSE = '__lcwResV5';
 
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * DeepSeek 会先把最终消息节点挂到 DOM，再继续补齐代码块内容。
- * 只要回复中的 JSON 对象尚未闭合，就不能交给核心解析，否则会把
- * 一次短暂的半截回复误判成失败并重发同一个工作单元。
- */
-function hasCompleteJsonObject(text: string): boolean {
-  const start = text.indexOf('{');
-  if (start < 0) return false;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let index = start; index < text.length; index++) {
-    const ch = text[index];
-    if (inString) {
-      if (escaped) escaped = false;
-      else if (ch === '\\') escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') inString = true;
-    else if (ch === '{') depth++;
-    else if (ch === '}') {
-      depth--;
-      if (depth === 0) return true;
+/** 只把账号文案转换为稳定的不透明标识，不把手机号/邮箱写入任务或日志。 */
+export function deriveDeepSeekAccountKey(text: string | null | undefined): string | undefined {
+  const normalized = text?.replace(/\s+/g, ' ').trim();
+  if (!normalized) return undefined;
+  let hash = 2166136261;
+  for (let index = 0; index < normalized.length; index++) {
+    hash ^= normalized.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `deepseek:${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+const MASKED_ACCOUNT_PATTERN = /(?<!\d)\d{2,4}(?:\s*\*){2,}\s*\d{2,4}(?!\d)/;
+const EMAIL_PATTERN = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+
+/** 从短页面文案中提取 DeepSeek 展示的脱敏账号，不接受聊天正文中的普通数字。 */
+export function extractDeepSeekAccountIdentityText(candidates: readonly string[]): string | undefined {
+  for (const candidate of candidates) {
+    const source = candidate.replace(/\s+/g, ' ').trim();
+    if (!source || source.length > 240) continue;
+    const masked = source.match(MASKED_ACCOUNT_PATTERN)?.[0];
+    if (masked) return masked.replace(/\s+/g, '');
+    const email = source.match(EMAIL_PATTERN)?.[0];
+    if (email) return email;
+  }
+  return undefined;
+}
+
+/** 账号可能只显示昵称；仅供页面底部账号入口使用，不用于扫描聊天正文。 */
+export function normalizeDeepSeekAccountLabel(text: string | null | undefined): string | undefined {
+  const source = text?.replace(/\s+/g, ' ').trim();
+  if (!source || source.length > 80 || /^(开启新对话|今天|昨天|7 天内|深度思考|智能搜索|欢迎回来)/.test(source)) return undefined;
+  return /[A-Za-z\u4e00-\u9fff]/.test(source) ? source : undefined;
+}
+
+export function readDeepSeekAccountIdentityText(root: ParentNode = document): string | undefined {
+  for (const selector of ACCOUNT_LABEL_SELECTORS) {
+    for (const label of root.querySelectorAll<HTMLElement>(selector)) {
+      if (label.closest(ACCOUNT_EXCLUDED_REGIONS) || !label.getClientRects().length) continue;
+      const text = label.innerText || label.textContent || '';
+      const identity = extractDeepSeekAccountIdentityText([text]) ?? normalizeDeepSeekAccountLabel(text);
+      if (identity) return identity;
     }
   }
-  return false;
+  // 动态 class 变化时保留结构性兜底：只看左侧底部、不可点击会话链接且不在滚动区的账号行。
+  const width = typeof window === 'undefined' ? 1_920 : window.innerWidth || 1_920;
+  const height = typeof window === 'undefined' ? 1_080 : window.innerHeight || 1_080;
+  for (const row of root.querySelectorAll<HTMLElement>('[tabindex="0"]')) {
+    const rect = row.getBoundingClientRect();
+    if (!rect.width || !rect.height || rect.left >= Math.min(420, width * 0.4) ||
+      rect.bottom <= height * 0.75 || row.closest(ACCOUNT_EXCLUDED_REGIONS)) continue;
+    const text = row.innerText || row.textContent || '';
+    const identity = extractDeepSeekAccountIdentityText([text]) ?? normalizeDeepSeekAccountLabel(text);
+    if (identity) return identity;
+  }
+  // 选择器失效时宁可保持未识别，也不使用会话标题或正文猜测账号。
+  return undefined;
+}
+
+/** 页面文案本身可能是完整邮箱；只保留可辨认的脱敏形式。 */
+export function describeDeepSeekAccount(text: string | undefined): ProviderAccountIdentity | undefined {
+  const key = deriveDeepSeekAccountKey(text);
+  if (!key || !text) return undefined;
+  const normalized = text.trim();
+  if (normalized.includes('@')) {
+    const [local, domain] = normalized.split('@');
+    return { key, label: `${local?.slice(0, 2) || '*'}***@${domain}` };
+  }
+  return { key, label: normalized };
+}
+
+function hasValidJsonPayload(text: string): boolean {
+  const start = text.search(/[\[{]/);
+  if (start < 0) return false;
+  try {
+    JSON.parse(text.slice(start));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 回复是否已经可以交给核心层处理。
+ *
+ * Provider 只负责判断页面是否已经停止生成；JSON 的语法和业务契约由核心层
+ * 解析。模型偶尔会在 JSON 字符串里输出未转义的引号，这类回复虽然不能解析，
+ * 但已经是页面上的最终文本，必须交给核心层走统一的安全重试，而不能伪装成
+ * “还没有回复”并无限等待。
+ */
+export function shouldAcceptReplyText(
+  text: string,
+  expectJson: boolean,
+  generating: boolean,
+  previousText: string | null,
+): boolean {
+  const normalized = text.trim();
+  if (!normalized) return false;
+  return !expectJson || hasValidJsonPayload(normalized) || (!generating && normalized === previousText);
 }
 
 function hasRepeatedReplyTail(text: string): boolean {
@@ -93,8 +170,12 @@ export class DeepSeekAdapter {
   private lastContinueAt = 0;
   private rateLimitNoticeVisible = false;
   private lastRateLimitReportAt = 0;
+  private lastAccountKey?: string;
 
   private reqId = 0;
+  private observer?: MutationObserver;
+  private heartbeat?: number;
+  private disposed = false;
 
   constructor(private readonly emit: (e: AdapterEvent) => void) {}
 
@@ -118,17 +199,27 @@ export class DeepSeekAdapter {
   }
 
   start(): void {
-    new MutationObserver((mutations) => {
+    this.observer = new MutationObserver((mutations) => {
       // Toast 可能在提交已确认后才出现，且几秒内消失；不能只在发送确认窗口检查。
       this.observeRateLimitNotice(mutations);
       this.tick();
-    }).observe(document.body, {
+    });
+    this.observer.observe(document.body, {
       childList: true,
       subtree: true,
       characterData: true,
     });
-    window.setInterval(() => this.tick(), HEARTBEAT_MS);
+    this.heartbeat = window.setInterval(() => this.tick(), HEARTBEAT_MS);
+    const account = this.getAccountIdentity();
+    this.lastAccountKey = account?.key;
+    this.emit({ channel: 'adapter', type: 'ready', accountKey: account?.key, accountLabel: account?.label });
     this.tick();
+  }
+
+  dispose(): void {
+    this.disposed = true;
+    this.observer?.disconnect();
+    window.clearInterval(this.heartbeat);
   }
 
   async handle(cmd: DeepSeekCommand): Promise<unknown> {
@@ -136,16 +227,20 @@ export class DeepSeekAdapter {
       case 'ping':
         return { ok: true, url: location.href };
       case 'status': {
-        if (!this.findInput()) return { state: 'unknown' };
+        const accountKey = this.getAccountIdentity()?.key;
+        if (findConversationLimitNotice()) return { state: 'conversation_limit', accountKey };
+        if (!this.findInput()) return { state: 'unknown', accountKey };
         const gen = await this.isGenerating();
         // 限流提示可能在人工点击“继续生成”后仍短暂残留；生成状态优先，
         // 否则后台会把真实的续写误判成仍在限流而跳过结果对账。
-        if (gen) return { state: 'generating' };
+        if (gen) return { state: 'generating', accountKey };
         if (this.checkRateLimitNotice() || Date.now() - this.lastRateLimitReportAt < RATE_LIMIT_NOTICE_GRACE_MS) {
-          return { state: 'rate_limited' };
+          return { state: 'rate_limited', accountKey };
         }
-        return { state: 'idle' };
+        return { state: 'idle', accountKey };
       }
+      case 'accountKey':
+        return this.getAccountIdentity();
       case 'newChat':
         return this.newChat();
       case 'setFeatures':
@@ -163,6 +258,10 @@ export class DeepSeekAdapter {
       default:
         return { ok: false, error: 'unknown command' };
     }
+  }
+
+  private getAccountIdentity(): ProviderAccountIdentity | undefined {
+    return describeDeepSeekAccount(readDeepSeekAccountIdentityText());
   }
 
   private findInput(): HTMLTextAreaElement | null {
@@ -322,6 +421,12 @@ export class DeepSeekAdapter {
   }
 
   private tick(): void {
+    if (this.disposed) return;
+    const account = this.getAccountIdentity();
+    if (account?.key !== this.lastAccountKey) {
+      this.lastAccountKey = account?.key;
+      this.emit({ channel: 'adapter', type: 'ready', accountKey: account?.key, accountLabel: account?.label });
+    }
     this.checkRateLimitNotice();
     const now = Date.now();
     if (now - this.lastTick < TICK_MS || this.tickRunning) return;
@@ -329,6 +434,7 @@ export class DeepSeekAdapter {
     this.tickRunning = true;
     void this.isGenerating()
       .then((generating) => {
+        if (this.disposed) return;
         // 必须在异步探针返回后比较；否则最后一次 DOM mutation 会永远丢失 generationEnd。
         if (generating !== this.generating) {
           this.generating = generating;
@@ -355,10 +461,13 @@ export class DeepSeekAdapter {
     const now = Date.now();
     if (now - this.lastRateLimitReportAt < 10_000) return;
     this.lastRateLimitReportAt = now;
+    const account = this.getAccountIdentity();
     this.emit({
       channel: 'adapter',
       type: 'rateLimited',
       detail,
+      accountKey: account?.key,
+      accountLabel: account?.label,
       retryAfterMs: DEEPSEEK_RATE_LIMIT_RETRY_MS,
       continuationRetryAfterMs: DEEPSEEK_CONTINUATION_PROBE_MS,
     });
@@ -375,7 +484,7 @@ export class DeepSeekAdapter {
         for (let depth = 0; element && depth < 5; depth++, element = element.parentElement) {
           const text = (element.textContent ?? '').replace(/\s+/g, ' ').trim();
           if (text.length > 160 || !isRateLimitNoticeText(text)) continue;
-          if (element.closest('.ds-markdown, .ds-assistant-message-main-content, textarea')) continue;
+          if (element.closest('.ds-message, .ds-markdown, .ds-assistant-message-main-content, textarea, input, [contenteditable="true"]')) continue;
           let floating: Element | null = element;
           for (let ancestor = 0; floating && ancestor < 5; ancestor++, floating = floating.parentElement) {
             if (getComputedStyle(floating).position !== 'fixed') continue;
@@ -431,7 +540,7 @@ export class DeepSeekAdapter {
   }
 
   private async sendPrompt(text: string): Promise<{
-    outcome: 'accepted' | 'rejected' | 'retryable' | 'rate_limited' | 'ambiguous';
+    outcome: 'accepted' | 'rejected' | 'retryable' | 'retry_current' | 'rate_limited' | 'ambiguous';
     url?: string | null;
     error?: string;
   }> {
@@ -454,6 +563,7 @@ export class DeepSeekAdapter {
         if (url) this.emit({ channel: 'adapter', type: 'remoteRefChanged', detail: url });
         if (confirmation.outcome === 'accepted') return { outcome: 'accepted', url };
         if (confirmation.outcome === 'retryable') return { outcome: 'retryable', url, error: confirmation.error };
+        if (confirmation.outcome === 'retry_current') return { outcome: 'retry_current', url, error: confirmation.error };
         if (confirmation.outcome === 'rate_limited') return { outcome: 'rate_limited', url, error: confirmation.error };
         return { outcome: 'ambiguous', url, error: '点击发送后未观察到输入框清空、生成开始或会话 URL 变化' };
       }
@@ -465,12 +575,15 @@ export class DeepSeekAdapter {
   private async waitForSubmissionConfirmation(
     originalText: string,
     timeoutMs: number,
-  ): Promise<{ outcome: 'accepted' | 'retryable' | 'rate_limited' | 'ambiguous'; url: string | null; error?: string }> {
+  ): Promise<{ outcome: 'accepted' | 'retryable' | 'retry_current' | 'rate_limited' | 'ambiguous'; url: string | null; error?: string }> {
     const deadline = Date.now() + timeoutMs;
     let acceptedAt: number | null = null;
     while (Date.now() < deadline) {
       const url = location.pathname.startsWith('/a/chat/') ? location.href : null;
       const bodyText = document.body?.innerText ?? '';
+      if (findConversationLimitNotice()) {
+        return { outcome: 'retry_current', url, error: 'DeepSeek 已达到对话长度上限，请开启新对话重试当前单元' };
+      }
       if (bodyText.includes('有消息正在生成，请稍后再试')) {
         return { outcome: 'retryable', url, error: 'DeepSeek 仍有消息正在生成' };
       }
@@ -493,15 +606,19 @@ export class DeepSeekAdapter {
    * 找不到时让探针向上滚动触发虚拟列表加载，再重试。
    */
   private async readReply(marker: string, expectJson: boolean): Promise<{ found: boolean; text?: string; error?: string }> {
+    let previousIncompleteText: string | null = null;
     for (let round = 0; round < 5; round++) {
       try {
         const r = await this.callMainProbe<{ found?: boolean; text?: string }>('readReply', { marker });
-        if (
-          r.found === true &&
-          typeof r.text === 'string' &&
-          r.text.trim().length > 0 &&
-          (!expectJson || hasCompleteJsonObject(r.text))
-        ) {
+        if (r.found === true && typeof r.text === 'string') {
+          const generating = !expectJson || hasValidJsonPayload(r.text)
+            ? false
+            : await this.isGenerating();
+          if (!shouldAcceptReplyText(r.text, expectJson, generating, previousIncompleteText)) {
+            previousIncompleteText = r.text.trim();
+            await wait(700);
+            continue;
+          }
           return { found: true, text: r.text };
         }
         await this.callMainProbe('scrollUp').catch(() => undefined);

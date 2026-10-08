@@ -21,6 +21,7 @@ import {
   type PromptTemplateSet,
   type TaskKind,
 } from '../core/types';
+import { summarizeTraffic } from './trafficSummary';
 
 const STATUS_LABEL: Record<JobStatus, string> = {
   split: '分块中',
@@ -374,7 +375,7 @@ function NewJobForm({ jobs, onStarted }: { jobs: Job[]; onStarted: (id: string) 
               disabled={smartTuning}
               onChange={(e) => setMaxChunkChars(Number(e.target.value) || DEFAULT_JOB_CONFIG.maxChunkChars)}
             />
-            <small className="hint">这是软目标；优先保留完整段落，允许适度超过，达到硬护栏时才按句末或标点拆分。</small>
+            <small className="hint">这是软目标；优先保留完整段落。Provider 报告对话长度上限时，程序会自动拆分当前内容并在后续阶段归并。</small>
           </label>
           <label>
             归并扇入
@@ -504,40 +505,37 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
   const active = ACTIVE_STATUSES.includes(job.status);
   const pct = prog && prog.total > 0 ? Math.round((prog.done / prog.total) * 100) : 0;
   const now = Date.now();
-  const latestRateLimit = job.rateLimitEvents?.at(-1);
-  const trafficHistory = job.trafficHistory ?? [];
-  const trafficInputSinceRateLimit = trafficHistory.filter((sample) =>
-    !latestRateLimit || sample.submittedAt > latestRateLimit.occurredAt,
+  const activeProviderRateLimits = (job.providerRateLimits ?? [])
+    .filter((entry) => entry.providerId === job.providerId && entry.limitedUntil > now)
+    .sort((left, right) => left.limitedUntil - right.limitedUntil);
+  const currentProviderRateLimit = activeProviderRateLimits.find((entry) => entry.accountKey === job.providerAccountKey);
+  // “本轮”必须按当前账号计算；换号后不能继续沿用旧账号的流量窗口。
+  const latestRateLimit = (job.rateLimitEvents ?? []).filter((event) =>
+    !job.providerAccountKey || event.accountKey === job.providerAccountKey,
+  ).at(-1);
+  const trafficHistory = (job.trafficHistory ?? []).filter((sample) =>
+    !job.providerAccountKey || sample.accountKey === job.providerAccountKey,
   );
-  const trafficOutputSinceRateLimit = trafficHistory.filter((sample) =>
-    !latestRateLimit || (sample.completedAt ?? sample.submittedAt) > latestRateLimit.occurredAt,
-  );
-  const trafficIntervalInput = trafficInputSinceRateLimit.reduce(
-    (total, sample) => total + Math.max(0, sample.inputChars),
-    0,
-  );
-  const trafficIntervalOutput = trafficOutputSinceRateLimit.reduce(
-    (total, sample) => total + Math.max(0, sample.outputChars ?? 0),
-    0,
-  );
+  const trafficSummary = summarizeTraffic(job);
   const cooldownActive = job.sessionCooldownUntil != null && job.sessionCooldownUntil > now;
   const officialCooldown = job.sessionCooldownReason?.startsWith('Provider 官方限流') === true;
-  const cooldownStartedAt = cooldownActive
+  const currentLimitKind = currentProviderRateLimit?.kind === 'proactive'
+    ? '主动限流'
+    : currentProviderRateLimit ? '官方限流' : cooldownActive ? (officialCooldown ? '官方限流' : '主动限流') : '—';
+  const currentLimitUntil = currentProviderRateLimit?.limitedUntil
+    ?? (cooldownActive ? job.sessionCooldownUntil : undefined);
+  const cooldownStartedAt = currentProviderRateLimit?.occurredAt ?? (cooldownActive
     ? job.sessionCooldownStartedAt ?? (officialCooldown && latestRateLimit &&
       latestRateLimit.occurredAt + latestRateLimit.retryAfterMs === job.sessionCooldownUntil
       ? latestRateLimit.occurredAt : null)
-    : null;
-  const intervalInput = trafficIntervalInput;
-  const intervalOutput = trafficIntervalOutput;
-  const cumulativeInput = (latestRateLimit?.cumulativeInputChars
-    ?? latestRateLimit?.inputChars
-    ?? 0) + intervalInput;
-  const cumulativeOutput = (latestRateLimit?.cumulativeOutputChars
-    ?? latestRateLimit?.outputChars
-    ?? 0) + intervalOutput;
-  const limitType = officialCooldown ? '官方限流' : '主动限流';
-  const showRateLimitSummary = cooldownActive;
-  const showTrafficSummary = trafficHistory.length > 0 || latestRateLimit != null;
+    : null);
+  const intervalInput = trafficSummary.inputChars;
+  const intervalOutput = trafficSummary.outputChars;
+  const cumulativeInput = trafficSummary.cumulativeInputChars;
+  const cumulativeOutput = trafficSummary.cumulativeOutputChars;
+  const showRateLimitSummary = cooldownActive || currentProviderRateLimit != null || !!job.providerAccountKey;
+  // 已识别新账号但尚未发送请求时也显示 0，明确表示本轮已按账号重置。
+  const showTrafficSummary = trafficHistory.length > 0 || latestRateLimit != null || !!job.providerAccountKey;
   const run = (cmd: Record<string, unknown>) => {
     setError(null);
     void sendCmd(cmd)
@@ -623,9 +621,17 @@ function JobDetail({ jobId, onDeleted }: { jobId: string; onDeleted: () => void 
               {showRateLimitSummary ? (
                 <tr>
                   <th scope="row">限流</th>
-                  <td>限流类型 {limitType ?? '—'}</td>
+                  <td>当前账号 {job.providerAccountLabel ?? '未识别'}</td>
+                  <td>限流类型 {currentLimitKind}</td>
                   <td>限流时间 {cooldownStartedAt != null ? new Date(cooldownStartedAt).toLocaleTimeString() : '—'}</td>
-                  <td>重试时间 {cooldownActive && job.sessionCooldownUntil ? new Date(job.sessionCooldownUntil).toLocaleTimeString() : '—'}</td>
+                  <td>重试时间 {currentLimitUntil ? new Date(currentLimitUntil).toLocaleTimeString() : '—'}</td>
+                  <td colSpan={2}>
+                    账号列表 {activeProviderRateLimits.length === 0
+                      ? '当前账号不在限流列表'
+                      : activeProviderRateLimits.map((entry) =>
+                        `${entry.accountLabel ?? '未命名账号'}：${entry.kind === 'proactive' ? '主动' : '官方'}至 ${new Date(entry.limitedUntil).toLocaleTimeString()}`,
+                      ).join('；')}
+                  </td>
                 </tr>
               ) : null}
             </tbody>

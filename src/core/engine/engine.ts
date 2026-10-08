@@ -9,10 +9,11 @@ import {
   formatMarker,
 } from '../protocol/prompts';
 import { isExtractionResult, isFormatPlan, isJsonResult, parseFormatPlan, parseIndexResult, parseJsonResult, sanitizeExtraction, sanitizeJsonResult } from '../protocol/schema';
-import type { ProviderHost, ProviderInspection, ProviderPrepareOutcome } from '../provider';
+import type { ProviderHost, ProviderInspection } from '../provider';
 import { planGroups } from '../reduce/reducePlanner';
 import {
   chunkMetasByJob,
+  compareChunkOrder,
   commitCollected,
   commitIndexed,
   commitUnitFailure,
@@ -31,6 +32,7 @@ import {
   saveJob,
   setActiveJobId,
   resultsByJob,
+  splitChunkForContextLimit,
 } from '../storage/jobStore';
 import type { ChunkMeta, CurrentUnit, FormatState, Job, JobStatus, RateLimitEvent, ResultPayload, ResultRecord, UnitKind } from '../types';
 import { sleep } from '../util/sleep';
@@ -98,7 +100,15 @@ export class Engine {
     if (!job || !isActive(job.status)) return;
     if (job.current) return this.reconcile(job, 'pump');
     if (job.status === 'waiting') job = await this.to(job, (job.reduceState || job.formatState) ? 'reducing' : 'processing');
+    // 没有在途单元时也先探测账号，避免暂停/重启后切换账号仍被旧官方冷却拦截。
+    try {
+      const connectionId = await this.ensureConnection(job);
+      job = await this.syncProviderAccount(job, connectionId);
+    } catch {
+      // 具体 Provider 不可用时由后续 dispatch 路径按既有错误处理重试。
+    }
     if (await this.deferForDispatchCooldown(job)) return;
+    job = (await getJob(job.id)) ?? job;
     if (job.status === 'processing') return this.dispatchNextChunkStage(job);
     if (job.status === 'reducing') return this.dispatchNextReduce(job);
   }
@@ -107,12 +117,34 @@ export class Engine {
   private async deferForDispatchCooldown(job: Job): Promise<boolean> {
     const now = Date.now();
     const existing = job.sessionCooldownUntil;
+    const accountLimit = job.providerAccountKey
+      ? (job.providerRateLimits ?? []).find((entry) => entry.providerId === job.providerId &&
+        entry.accountKey === job.providerAccountKey && entry.limitedUntil > now)
+      : undefined;
+    if (accountLimit) {
+      let waiting: Job = { ...job, sessionCooldownUntil: accountLimit.limitedUntil,
+        sessionCooldownStartedAt: accountLimit.occurredAt,
+        sessionCooldownReason: accountLimit.reason,
+        sessionCooldownAccountKey: accountLimit.accountKey };
+      await saveJob(waiting);
+      if (waiting.status !== 'waiting') waiting = await this.to(waiting, 'waiting');
+      this.host.scheduleAlarm(RESUME_ALARM(job.id), accountLimit.limitedUntil);
+      return true;
+    }
     if (existing != null) {
-      if (existing > now) {
-        this.host.scheduleAlarm(RESUME_ALARM(job.id), existing);
+      // 已识别账号时，限流列表是唯一的调度依据。旧摘要不能挡住不在列表中的账号。
+      if (job.providerAccountKey && !accountLimit) {
+        await saveJob({ ...job, sessionCooldownUntil: undefined, sessionCooldownStartedAt: undefined,
+          sessionCooldownReason: undefined, sessionCooldownAccountKey: undefined });
+        return false;
+      }
+      const until = existing;
+      if (until > now) {
+        this.host.scheduleAlarm(RESUME_ALARM(job.id), until);
         return true;
       }
-      job = { ...job, sessionCooldownUntil: undefined, sessionCooldownStartedAt: undefined, sessionCooldownReason: undefined };
+      job = { ...job, sessionCooldownUntil: undefined, sessionCooldownStartedAt: undefined,
+        sessionCooldownReason: undefined, sessionCooldownAccountKey: undefined };
       await saveJob(job);
       return false;
     }
@@ -135,11 +167,7 @@ export class Engine {
     await setActiveJobId(jobId);
     job = await this.to(job, job.prevStatus ?? (job.reduceState || job.formatState ? 'reducing' : 'processing'));
     if (job.current) {
-      if (job.sessionCooldownUntil != null && job.sessionCooldownUntil > Date.now()) {
-        this.host.scheduleAlarm(RESUME_ALARM(job.id), job.sessionCooldownUntil);
-      } else {
-        await this.reconcile(job, 'resume');
-      }
+      await this.onAlarm(RESUME_ALARM(job.id));
     }
     else await this.pump(job.id);
   }
@@ -165,7 +193,8 @@ export class Engine {
       finalResultId: null, lastError: null,
       sessionCooldownUntil: cooldownActive ? job.sessionCooldownUntil : undefined,
       sessionCooldownStartedAt: cooldownActive ? job.sessionCooldownStartedAt : undefined,
-      sessionCooldownReason: cooldownActive ? job.sessionCooldownReason : undefined };
+      sessionCooldownReason: cooldownActive ? job.sessionCooldownReason : undefined,
+      sessionCooldownAccountKey: cooldownActive ? job.sessionCooldownAccountKey : undefined };
     await saveJob(job);
     if (job.status === 'failed' || job.status === 'completed') job = await this.to(job, 'processing');
     if (isActive(job.status)) {
@@ -197,6 +226,7 @@ export class Engine {
         sessionCooldownUntil: cooldownActive ? job.sessionCooldownUntil : undefined,
         sessionCooldownStartedAt: cooldownActive ? job.sessionCooldownStartedAt : undefined,
         sessionCooldownReason: cooldownActive ? job.sessionCooldownReason : undefined,
+        sessionCooldownAccountKey: cooldownActive ? job.sessionCooldownAccountKey : undefined,
       });
       return;
     }
@@ -221,6 +251,7 @@ export class Engine {
       sessionCooldownUntil: cooldownActive ? job.sessionCooldownUntil : undefined,
       sessionCooldownStartedAt: cooldownActive ? job.sessionCooldownStartedAt : undefined,
       sessionCooldownReason: cooldownActive ? job.sessionCooldownReason : undefined,
+      sessionCooldownAccountKey: cooldownActive ? job.sessionCooldownAccountKey : undefined,
     };
     await saveJob(job);
     if (job.status === 'failed' || job.status === 'completed') job = await this.to(job, 'processing');
@@ -297,15 +328,16 @@ export class Engine {
     if (!match?.[2]) return;
     let job = await getJob(match[2]);
     if (!job || !isActive(job.status)) return;
-    if (job.sessionCooldownUntil != null) {
-      if (job.sessionCooldownUntil > Date.now()) {
-        this.host.scheduleAlarm(RESUME_ALARM(job.id), job.sessionCooldownUntil);
-        // 官方冷却期间不自动检查，也不自动点击“继续生成”；用户可通过界面按钮触发一次只读确认。
-        return;
+    if (job.current || job.sessionCooldownUntil != null || job.providerRateLimits?.length) {
+      try {
+        const connectionId = await this.ensureConnection(job);
+        job = await this.syncProviderAccount(job, connectionId);
+      } catch {
+        // 对账路径会报告 Provider 暂不可用；告警处理不能因此丢失持久化状态。
       }
-      job = { ...job, sessionCooldownUntil: undefined, sessionCooldownStartedAt: undefined, sessionCooldownReason: undefined };
-      await saveJob(job);
     }
+    if (await this.deferForDispatchCooldown(job)) return;
+    job = (await getJob(job.id)) ?? job;
     if (job.current?.rateLimited) {
       if (job.current.manualIntervention) {
         await this.reconcile(job, 'manual intervention after cooldown');
@@ -328,10 +360,16 @@ export class Engine {
     else await this.pump(job.id);
   }
 
-  async onAdapterReady(connectionId: string): Promise<void> {
+  async onAdapterReady(connectionId: string, accountKey?: string, accountLabel?: string): Promise<void> {
     const job = await this.activeJob();
     if (!job || (job.providerConnectionId && job.providerConnectionId !== connectionId)) return;
-    if (job.current) this.host.scheduleAlarm(RESUME_ALARM(job.id), Date.now() + 1_500);
+    const changed = !!accountKey && accountKey !== job.providerAccountKey;
+    const synced = await this.syncProviderAccount(job, connectionId, accountKey, accountLabel);
+    if (changed && isActive(synced.status)) {
+      this.host.scheduleAlarm(RESUME_ALARM(synced.id), Date.now() + 1);
+      return;
+    }
+    if (synced.current) this.host.scheduleAlarm(RESUME_ALARM(synced.id), Date.now() + 1_500);
   }
 
   async onGenerationStart(_connectionId: string): Promise<void> {}
@@ -373,10 +411,11 @@ export class Engine {
   }
 
 
-  async onRateLimited(connectionId: string, detail: string, retryAfterMs?: number, continuationRetryAfterMs?: number): Promise<void> {
+  async onRateLimited(connectionId: string, detail: string, retryAfterMs?: number, continuationRetryAfterMs?: number, accountKey?: string, accountLabel?: string): Promise<void> {
     const job = await this.activeJob();
     if (!job || job.providerConnectionId !== connectionId) return;
-    await this.noteRateLimit(job, detail, retryAfterMs, continuationRetryAfterMs);
+    const synced = await this.syncProviderAccount(job, connectionId, accountKey, accountLabel);
+    await this.noteRateLimit(synced, detail, retryAfterMs, continuationRetryAfterMs, accountKey, accountLabel);
   }
 
   async onAdapterError(connectionId: string, detail: string): Promise<void> {
@@ -425,7 +464,7 @@ export class Engine {
     if (job.config.taskKind === 'knowledge' && job.config.pipelineMode === 'staged' && !job.formatPlanResultId) {
       return this.dispatchInitialFormat(job);
     }
-    const metas = (await chunkMetasByJob(job.id)).sort((a, b) => a.index - b.index);
+    const metas = (await chunkMetasByJob(job.id)).sort(compareChunkOrder);
     // 多阶段流程有全局屏障：必须先为所有分块建立索引，才允许进入目标处理阶段。
     // 否则模型会在索引尚未完整时开始深炼，导致跨块事件无法对齐。
     const meta = job.config.pipelineMode === 'staged'
@@ -435,7 +474,10 @@ export class Engine {
     if (!meta) {
       const progress = await jobProgress(job.id);
       if (progress.sent > 0) return;
-      if (progress.failed > 0) return this.failJob(job, `有 ${progress.failed} 个分块失败，请重试后再归并`);
+      if (progress.failed > 0) {
+        const reason = job.lastError ? `；最近原因：${job.lastError}` : '';
+        return this.failJob(job, `有 ${progress.failed} 个分块失败，请重试后再归并${reason}`);
+      }
       return this.beginReduce(job);
     }
     const text = await getChunkTextById(meta.id);
@@ -466,7 +508,7 @@ export class Engine {
   }
 
   private async loadChunkSamples(jobId: string): Promise<string[]> {
-    const metas = (await chunkMetasByJob(jobId)).sort((left, right) => left.index - right.index).slice(0, 3);
+    const metas = (await chunkMetasByJob(jobId)).sort(compareChunkOrder).slice(0, 3);
     const samples: string[] = [];
     for (const meta of metas) {
       const text = await getChunkTextById(meta.id);
@@ -542,7 +584,7 @@ export class Engine {
       const results = await this.loadResults(state.outputIds);
       if (results.length !== state.outputIds.length) return this.failJob(job, '归并结果记录缺失');
       const groups = planGroups(results.map((r) => r.raw.length),
-        { fanIn: job.config.fanIn, maxChars: job.config.maxChunkChars });
+        { fanIn: job.config.fanIn, maxChars: Math.min(job.config.maxChunkChars, job.contextInputBudget ?? Infinity) });
       if (groups.length >= state.outputIds.length) {
         return this.failJob(job, '归并输入超过预算且无法继续收敛；请提高归并预算或缩小提炼结果');
       }
@@ -571,17 +613,25 @@ export class Engine {
 
   private async loadFormatSamples(inputIds: string[]): Promise<string[]> {
     const results = await this.loadResults(inputIds);
+    const maxTotalChars = 48_000;
+    let totalChars = 0;
     return results.map((result) => {
+      if (totalChars >= maxTotalChars) return '';
       if (isJsonResult(result.parsed)) {
-        return JSON.stringify(isExtractionResult(result.parsed)
+        const sample = JSON.stringify(isExtractionResult(result.parsed)
           ? {
               knowledge: result.parsed.knowledge.slice(0, 4),
               ...(result.parsed.people ? { people: result.parsed.people.slice(0, 4) } : {}),
             }
           : result.parsed);
+        const bounded = sample.slice(0, Math.min(4_000, maxTotalChars - totalChars));
+        totalChars += bounded.length;
+        return bounded;
       }
-      return result.raw.slice(0, 4_000);
-    });
+      const bounded = result.raw.slice(0, Math.min(4_000, maxTotalChars - totalChars));
+      totalChars += bounded.length;
+      return bounded;
+    }).filter(Boolean);
   }
 
   private async finishFormatNormalization(job: Job): Promise<void> {
@@ -602,7 +652,7 @@ export class Engine {
     if (results.length !== state.outputIds.length) return this.failJob(job, '格式统一结果缺失');
     const groups = planGroups(results.map((result) => result.raw.length), {
       fanIn: job.config.fanIn,
-      maxChars: job.config.maxChunkChars,
+      maxChars: Math.min(job.config.maxChunkChars, job.contextInputBudget ?? Infinity),
     });
     if (groups.length >= state.outputIds.length) return this.failJob(job, '格式统一结果超过归并预算且无法收敛');
     const next = {
@@ -653,16 +703,19 @@ export class Engine {
     if (!current || current.phase !== 'prepared') return;
     const marker = current.marker;
     try {
-      const pacedJob = { ...job, current: { ...current, inputChars: prompt.length } };
-      if (await this.deferForProviderCooldown(pacedJob, prompt.length)) return;
       const connectionId = await this.ensureConnection(job);
-      const preparation = await this.host.prepare(connectionId, current);
+      job = await this.syncProviderAccount(job, connectionId);
+      if (await this.deferForProviderAccountLimit(job)) return;
+      const pacedJob = { ...job, current: { ...job.current!, inputChars: prompt.length } };
+      if (await this.deferForProviderCooldown(pacedJob, prompt.length)) return;
+      const preparation = await this.host.prepare(connectionId, job.current!);
       if (preparation?.status === 'retry_current') {
-        return this.retryMissingRemoteSession(job, preparation);
+        return this.retryUnavailableUnit(job, preparation);
       }
       const fresh = await getJob(job.id);
       if (!fresh || fresh.status === 'paused' || fresh.status === 'canceled' || fresh.current?.marker !== marker) return;
-      job = { ...fresh, current: { ...fresh.current!, phase: 'submitting', inputChars: prompt.length }, providerConnectionId: connectionId };
+      job = { ...fresh, current: { ...fresh.current!, phase: 'submitting', inputChars: prompt.length,
+        submissionAccountKey: fresh.providerAccountKey }, providerConnectionId: connectionId };
       await saveJob(job);
       const outcome = await this.host.submit(connectionId, marker, prompt);
       if (outcome.status === 'accepted') {
@@ -674,6 +727,8 @@ export class Engine {
         this.host.scheduleAlarm(TIMEOUT_ALARM(job.id), Date.now() + job.config.generationTimeoutMs);
       } else if (outcome.status === 'rate_limited') {
         await this.noteRateLimit(job, outcome.detail, outcome.retryAfterMs, outcome.continuationRetryAfterMs);
+      } else if (outcome.status === 'retry_current') {
+        await this.retryUnavailableUnit(job, outcome);
       } else if (outcome.status === 'retryable') {
         await this.scheduleSafeRetry(job, outcome.detail, outcome.retryAfterMs);
       } else if (outcome.status === 'rejected') {
@@ -699,13 +754,35 @@ export class Engine {
     const now = Date.now();
     const advice = await this.host.getDispatchCooldown?.(job, inputChars, now);
     if (!advice || advice.until <= now || !job.current) return false;
+    const existingLimit = job.providerAccountKey && (job.providerRateLimits ?? []).find((entry) =>
+      entry.providerId === job.providerId && entry.accountKey === job.providerAccountKey && entry.limitedUntil > now,
+    );
+    if (existingLimit && existingLimit.kind !== 'proactive') return false;
     const until = Math.max(now + RETRY_DELAY_MS, advice.until);
+    const providerRateLimits = job.providerAccountKey
+      ? [
+        ...(job.providerRateLimits ?? []).filter((entry) =>
+          !(entry.providerId === job.providerId && entry.accountKey === job.providerAccountKey),
+        ),
+        {
+          providerId: job.providerId,
+          accountKey: job.providerAccountKey,
+          accountLabel: job.providerAccountLabel,
+          kind: 'proactive' as const,
+          limitedUntil: until,
+          occurredAt: now,
+          reason: advice.detail,
+        },
+      ]
+      : job.providerRateLimits;
     let waiting: Job = {
       ...job,
       current: { ...job.current, inputChars },
       sessionCooldownUntil: until,
       sessionCooldownStartedAt: now,
       sessionCooldownReason: advice.detail,
+      sessionCooldownAccountKey: job.providerAccountKey,
+      providerRateLimits,
       lastError: null,
     };
     await saveJob(waiting);
@@ -730,24 +807,103 @@ export class Engine {
     return id;
   }
 
+  /** 同步当前 Provider 账号，并在切换账号后解除旧账号留下的在途限流阻塞。 */
+  private async syncProviderAccount(job: Job, connectionId: string, accountKey?: string, accountLabel?: string): Promise<Job> {
+    const identity = accountKey
+      ? { key: accountKey, label: accountLabel }
+      : await this.host.getAccountIdentity?.(connectionId);
+    const observed = identity?.key;
+    if (!observed) {
+      if (job.providerConnectionId === connectionId) return job;
+      const rebound = { ...job, providerConnectionId: connectionId };
+      await saveJob(rebound);
+      return rebound;
+    }
+    const accountCooldownSwitched = !!job.sessionCooldownAccountKey &&
+      job.sessionCooldownAccountKey !== observed;
+    const accountSwitched = !!job.providerAccountKey && job.providerAccountKey !== observed;
+    const legacyCooldown = !accountSwitched && !accountCooldownSwitched &&
+      (job.sessionCooldownUntil ?? 0) > Date.now() &&
+      !(job.providerRateLimits ?? []).some((entry) => entry.providerId === job.providerId && entry.accountKey === observed);
+    if (
+      observed === job.providerAccountKey &&
+      !legacyCooldown &&
+      job.providerConnectionId === connectionId &&
+      (identity?.label === undefined || identity.label === job.providerAccountLabel)
+    ) return job;
+    const switched = job.current?.rateLimited === true &&
+      (accountSwitched || (!!job.current.rateLimitAccountKey && job.current.rateLimitAccountKey !== observed));
+    const providerRateLimits = legacyCooldown ? [...(job.providerRateLimits ?? []), {
+      providerId: job.providerId, accountKey: observed, accountLabel: identity?.label,
+      kind: job.sessionCooldownReason?.startsWith('Provider 官方限流') ? 'official' as const : 'proactive' as const,
+      occurredAt: job.sessionCooldownStartedAt ?? Date.now(), limitedUntil: job.sessionCooldownUntil!,
+      reason: job.sessionCooldownReason,
+    }] : job.providerRateLimits;
+    const next: Job = {
+      ...job,
+      providerConnectionId: connectionId,
+      providerAccountKey: observed,
+      providerAccountLabel: identity?.label ?? (accountSwitched ? undefined : job.providerAccountLabel),
+      providerAccountChangedAt: accountSwitched ? Date.now() : job.providerAccountChangedAt,
+      providerRateLimits,
+      sessionCooldownUntil: accountCooldownSwitched || accountSwitched ? undefined : job.sessionCooldownUntil,
+      sessionCooldownStartedAt: accountCooldownSwitched || accountSwitched ? undefined : job.sessionCooldownStartedAt,
+      sessionCooldownReason: accountCooldownSwitched || accountSwitched ? undefined : job.sessionCooldownReason,
+      sessionCooldownAccountKey: accountCooldownSwitched || accountSwitched ? undefined : legacyCooldown ? observed : job.sessionCooldownAccountKey,
+      current: switched && job.current ? {
+        ...job.current,
+        rateLimited: undefined,
+        rateLimitAccountKey: undefined,
+        retryAfterAt: undefined,
+        continuationProbeAt: undefined,
+        manualIntervention: undefined,
+      } : job.current,
+      lastError: switched ? null : job.lastError,
+    };
+    await saveJob(next);
+    return next;
+  }
+
+  /** 发送准备前统一检查当前账号的限流列表。 */
+  private async deferForProviderAccountLimit(job: Job): Promise<boolean> {
+    const current = job;
+    const accountKey = current.providerAccountKey;
+    if (!accountKey) return false;
+    const now = Date.now();
+    const active = (current.providerRateLimits ?? []).find((entry) =>
+      entry.providerId === current.providerId && entry.accountKey === accountKey && entry.limitedUntil > now,
+    );
+    if (!active || !current.current) return false;
+    const waiting = appendJobEvent({ ...current, sessionCooldownUntil: active.limitedUntil,
+      sessionCooldownStartedAt: active.occurredAt, sessionCooldownReason: active.reason,
+      sessionCooldownAccountKey: active.accountKey,
+      lastError: active.reason ?? '当前 Provider 账号仍在限流冷却中' }, 'rate-limit-wait',
+      `当前账号限流至 ${new Date(active.limitedUntil).toLocaleTimeString()}`);
+    await saveJob(waiting);
+    if (waiting.status !== 'waiting' && waiting.status !== 'paused') await this.to(waiting, 'waiting');
+    this.host.clearAlarm(TIMEOUT_ALARM(waiting.id));
+    this.host.scheduleAlarm(RESUME_ALARM(waiting.id), active.limitedUntil);
+    return true;
+  }
+
   private async reconcile(job: Job, why: string): Promise<void> {
     if (job.status === 'paused' || !job.current) return;
-    const rateLimited = job.current.rateLimited === true;
-    const retryAfterAt = job.current.retryAfterAt ?? Date.now() + LEGACY_RATE_LIMIT_GRACE_MS;
-    if (rateLimited && !job.current.retryAfterAt) {
-      job = { ...job, current: { ...job.current, retryAfterAt } };
-      await saveJob(job);
-    }
-    if (rateLimited && retryAfterAt <= Date.now()) return this.resend(job, 'Provider 限流退避结束');
-    const unit = job.current;
+    let unit: CurrentUnit | null = job.current;
     if (!unit) return;
     if (unit.phase === 'prepared') return this.resumePrepared(job);
     try {
       const connectionId = await this.ensureConnection(job);
-      if (connectionId !== job.providerConnectionId) {
-        job = { ...job, providerConnectionId: connectionId };
+      job = await this.syncProviderAccount(job, connectionId);
+      unit = job.current;
+      if (!unit) return;
+      const rateLimited = job.current?.rateLimited === true &&
+        (!job.current.rateLimitAccountKey || !job.providerAccountKey || job.current.rateLimitAccountKey === job.providerAccountKey);
+      const retryAfterAt = job.current?.retryAfterAt ?? Date.now() + LEGACY_RATE_LIMIT_GRACE_MS;
+      if (rateLimited && !job.current?.retryAfterAt) {
+        job = { ...job, current: { ...job.current!, retryAfterAt } };
         await saveJob(job);
       }
+      if (rateLimited && retryAfterAt <= Date.now()) return this.resend(job, 'Provider 限流退避结束');
       const preparation = await this.host.prepare(connectionId, unit);
       if (preparation?.status === 'retry_current') {
         if (rateLimited && retryAfterAt > Date.now()) {
@@ -755,7 +911,7 @@ export class Engine {
           this.host.scheduleAlarm(RESUME_ALARM(job.id), retryAfterAt);
           return;
         }
-        return this.retryMissingRemoteSession(job, preparation);
+        return this.retryUnavailableUnit(job, preparation);
       }
       await this.handleInspection(job, await this.host.inspect(connectionId, unit), why);
     } catch (error) {
@@ -848,7 +1004,7 @@ export class Engine {
         this.host.scheduleAlarm(RESUME_ALARM(job.id), current.retryAfterAt!);
         return;
       }
-      await this.retryMissingRemoteSession(job, inspection);
+      await this.retryUnavailableUnit(job, inspection);
     } else if (inspection.status === 'generating') {
       if (current.completionObservedAt || job.lastError) {
         job = { ...job, lastError: null, current: { ...current, completionObservedAt: undefined } };
@@ -904,27 +1060,45 @@ export class Engine {
     return job.config.deepThinking ? Math.max(normalDelayMs, DEEP_THINKING_RECONCILE_MS) : normalDelayMs;
   }
 
-  private async noteRateLimit(job: Job, detail: string, retryAfterMs?: number, _continuationRetryAfterMs?: number): Promise<void> {
+  private async noteRateLimit(job: Job, detail: string, retryAfterMs?: number, _continuationRetryAfterMs?: number, accountKey?: string, accountLabel?: string): Promise<void> {
     const now = Date.now();
-    if (job.current?.rateLimited) return;
-    if (job.sessionCooldownUntil != null && job.sessionCooldownUntil > now &&
+    const limitedAccountKey = accountKey ?? job.providerAccountKey;
+    if (job.current?.rateLimited && (!limitedAccountKey || job.current.rateLimitAccountKey === limitedAccountKey)) return;
+    if (!limitedAccountKey && job.sessionCooldownUntil != null && job.sessionCooldownUntil > now &&
       job.sessionCooldownReason?.startsWith('Provider 官方限流')) return;
     const retryDelay = this.retryDelay(retryAfterMs);
     const previousAt = job.rateLimitEvents?.at(-1)?.occurredAt ?? 0;
+    const previousAccountAt = limitedAccountKey
+      ? job.rateLimitEvents?.filter((event) => event.accountKey === limitedAccountKey).at(-1)?.occurredAt ?? 0
+      : previousAt;
     const history = job.trafficHistory ?? [];
-    const submittedSamples = history.filter((sample) => sample.submittedAt > previousAt && sample.submittedAt <= now);
+    const accountMatches = (sample: { accountKey?: string }): boolean =>
+      !limitedAccountKey || sample.accountKey === limitedAccountKey;
+    const submittedSamples = history.filter((sample) => accountMatches(sample) && sample.submittedAt > previousAccountAt && sample.submittedAt <= now);
+    const allSubmittedSamples = history.filter((sample) => sample.submittedAt > previousAt && sample.submittedAt <= now);
     const completedSamples = history.filter((sample) => {
+      const completedAt = sample.completedAt ?? sample.submittedAt;
+      return accountMatches(sample) && completedAt > previousAccountAt && completedAt <= now;
+    });
+    const allCompletedSamples = history.filter((sample) => {
       const completedAt = sample.completedAt ?? sample.submittedAt;
       return completedAt > previousAt && completedAt <= now;
     });
-    const countedCurrent = job.current && !submittedSamples.some((sample) => sample.marker === job.current?.marker) ? [job.current] : [];
+    const unrecordedCurrent = job.current && job.current.phase !== 'prepared' &&
+      !history.some((sample) => sample.marker === job.current?.marker) ? job.current : undefined;
+    const countedCurrent = unrecordedCurrent && accountMatches({ accountKey: unrecordedCurrent.submissionAccountKey ?? job.providerAccountKey })
+      ? [unrecordedCurrent] : [];
     const intervalInputChars = submittedSamples.reduce((total, sample) => total + Math.max(0, sample.inputChars), 0)
       + countedCurrent.reduce((total, unit) => total + Math.max(0, unit.inputChars ?? 0), 0);
     const intervalOutputChars = completedSamples.reduce((total, sample) => total + Math.max(0, sample.outputChars ?? 0), 0);
+    const totalIntervalInputChars = allSubmittedSamples.reduce((total, sample) => total + Math.max(0, sample.inputChars), 0)
+      + Math.max(0, unrecordedCurrent?.inputChars ?? 0);
+    const totalIntervalOutputChars = allCompletedSamples.reduce((total, sample) => total + Math.max(0, sample.outputChars ?? 0), 0);
     const previous = job.rateLimitEvents?.at(-1);
-    const cumulativeInputChars = (previous?.cumulativeInputChars ?? previous?.inputChars ?? 0) + intervalInputChars;
-    const cumulativeOutputChars = (previous?.cumulativeOutputChars ?? previous?.outputChars ?? 0) + intervalOutputChars;
+    const cumulativeInputChars = (previous?.cumulativeInputChars ?? previous?.inputChars ?? 0) + totalIntervalInputChars;
+    const cumulativeOutputChars = (previous?.cumulativeOutputChars ?? previous?.outputChars ?? 0) + totalIntervalOutputChars;
     const event: RateLimitEvent = {
+      accountKey: limitedAccountKey,
       occurredAt: now,
       sentCount: job.stats.sent,
       providerSessionCount: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs.length : 0,
@@ -940,19 +1114,40 @@ export class Engine {
     };
     const rateLimitEvents = [...(job.rateLimitEvents ?? []), event].slice(-RATE_LIMIT_EVENT_HISTORY_LIMIT);
     const retryAfterAt = now + retryDelay;
-    const existingCooldown = job.sessionCooldownUntil ?? 0;
+    const providerRateLimits = [...(job.providerRateLimits ?? [])];
+    if (limitedAccountKey) {
+      const existing = providerRateLimits.find((entry) => entry.providerId === job.providerId &&
+        entry.accountKey === limitedAccountKey && entry.limitedUntil > now);
+      if (existing && existing.kind !== 'proactive' && !job.current?.rateLimited) return;
+      const withoutCurrent = providerRateLimits.filter((entry) =>
+        !(entry.providerId === job.providerId && entry.accountKey === limitedAccountKey),
+      );
+      withoutCurrent.push({
+        providerId: job.providerId,
+        accountKey: limitedAccountKey,
+        accountLabel: accountLabel ?? job.providerAccountLabel,
+        kind: 'official',
+        limitedUntil: retryAfterAt,
+        occurredAt: now,
+        reason: detail,
+      });
+      providerRateLimits.splice(0, providerRateLimits.length, ...withoutCurrent);
+    }
     job = appendJobEvent({
       ...job,
       current: job.current ? {
         ...job.current,
         rateLimited: true,
+        rateLimitAccountKey: limitedAccountKey,
         retryAfterAt,
         continuationProbeAt: undefined,
       } : null,
-      // 限流也要落到任务级冷却，覆盖当前单元为空、暂停后继续和扩展重载恢复。
-      sessionCooldownUntil: Math.max(existingCooldown, retryAfterAt),
+      // 兼容旧版工作台和恢复逻辑保留摘要字段；实际是否阻塞由 providerRateLimits + accountKey 决定。
+      sessionCooldownUntil: retryAfterAt,
       sessionCooldownStartedAt: now,
       sessionCooldownReason: `Provider 官方限流，${Math.ceil(retryDelay / 60_000)} 分钟后重试`,
+      sessionCooldownAccountKey: limitedAccountKey,
+      providerRateLimits,
       rateLimitEvents,
       lastError: detail,
       stats: { ...job.stats, rateLimitHits: job.stats.rateLimitHits + 1 },
@@ -966,6 +1161,7 @@ export class Engine {
       intervalOutputChars: event.intervalOutputChars,
       cumulativeInputChars: event.cumulativeInputChars,
       cumulativeOutputChars: event.cumulativeOutputChars,
+      accountKey: event.accountKey,
       retryAfterMs: event.retryAfterMs,
     });
     await saveJob(job);
@@ -975,8 +1171,9 @@ export class Engine {
   }
 
   /** Provider 已确认原远端会话被删除或不可恢复；递增 attempt 后在新会话重发。 */
-  private async retryMissingRemoteSession(job: Job, preparation: Extract<ProviderPrepareOutcome, { status: 'retry_current' }>): Promise<void> {
+  private async retryUnavailableUnit(job: Job, preparation: Extract<ProviderInspection, { status: 'retry_current' }>): Promise<void> {
     if (!job.current) return;
+    if (preparation.strategy === 'split_input' && await this.splitCurrentForContextLimit(job, preparation.detail)) return;
     const recovered: Job = {
       ...job,
       current: {
@@ -989,13 +1186,72 @@ export class Engine {
       lastError: preparation.detail,
     };
     await saveJob(recovered);
-    await this.resend(recovered, preparation.detail, true);
+    await this.resend(recovered, preparation.detail);
+  }
+
+  /** 上下文超限时分割原文或当前归并组，再由后续阶段继续合并结果。 */
+  private async splitCurrentForContextLimit(job: Job, detail: string): Promise<boolean> {
+    const unit = job.current;
+    if (!unit) return false;
+    if (unit.kind === 'index' || unit.kind === 'extract') {
+      const meta = await getChunkMeta(job.id, Number(unit.ref));
+      const text = meta ? await getChunkTextById(meta.id) : undefined;
+      if (!meta || text == null || text.length < 2_000) return false;
+      // 每次严格缩小输入，保留所有字符；优先在中间附近的行边界分割。
+      let middle = Math.ceil(text.length / 2);
+      const newline = text.lastIndexOf('\n', middle);
+      if (newline >= middle * 0.75) middle = newline + 1;
+      // 不拆开 UTF-16 代理对。
+      if (/[\uD800-\uDBFF]/.test(text[middle - 1]!)) middle++;
+      const parts = [text.slice(0, middle), text.slice(middle)];
+      if (!(await splitChunkForContextLimit(job.id, unit.marker, parts, detail))) return true;
+      return this.pump(job.id).then(() => true);
+    }
+    const state = unit.kind === 'normalize' ? job.formatState : unit.kind === 'reduce' ? job.reduceState : null;
+    if (state && state.groups.length > 0) {
+      const groupIndex = state.nextGroup;
+      const group = state.groups[groupIndex];
+      if (group && group.end - group.start >= 2) {
+        const middle = group.start + Math.ceil((group.end - group.start) / 2);
+        const groups = [...state.groups.slice(0, groupIndex),
+          { start: group.start, end: middle }, { start: middle, end: group.end },
+          ...state.groups.slice(groupIndex + 1)];
+        const inputs = await this.loadResults(state.inputIds.slice(group.start, group.end));
+        const inputChars = inputs.reduce((sum, result) => sum + Math.max(result.raw.length, JSON.stringify(result.parsed).length), 0);
+        const budget = Math.max(1, Math.floor(inputChars / 2));
+        const reusedOutputIds: Record<number, string> = {};
+        for (const [key, value] of Object.entries(state.reusedOutputIds ?? {})) {
+          const index = Number(key);
+          if (index !== groupIndex) reusedOutputIds[index > groupIndex ? index + 1 : index] = value;
+        }
+        const reprocessAttemptBases = { ...job.reprocessAttemptBases };
+        reprocessAttemptBases[`${unit.kind}:${unit.ref}`] = unit.attempt;
+        // 插入后组编号移动，所有尚未处理的编号都必须避开历史请求标识。
+        for (let i = groupIndex + 1; i < groups.length; i++) {
+          const ref = unit.kind === 'normalize' ? `batch-${i}` : `${job.reduceState!.level}-${i}`;
+          reprocessAttemptBases[`${unit.kind}:${ref}`] = Math.max(unit.attempt,
+            job.reprocessAttemptBases?.[`${unit.kind}:${ref}`] ?? 0,
+            job.reprocessAttemptBases?.[`${unit.kind}:${unit.kind === 'normalize' ? `batch-${i - 1}` : `${job.reduceState!.level}-${i - 1}`}`] ?? 0);
+        }
+        const nextJob: Job = unit.kind === 'normalize'
+          ? { ...job, formatState: { ...job.formatState!, groups, reusedOutputIds }, current: null, lastError: detail }
+          : { ...job, reduceState: { ...job.reduceState!, groups, reusedOutputIds }, current: null, lastError: detail };
+        await saveJob(appendJobEvent({ ...nextJob, reprocessAttemptBases,
+          contextInputBudget: Math.min(job.contextInputBudget ?? Infinity, budget),
+        }, 'context-split',
+          `${unit.kind}/${unit.ref} 达到对话长度上限，已拆分当前归并组后继续`));
+        await this.pump(job.id);
+        return true;
+      }
+    }
+    return false;
   }
 
   private async resend(job: Job, reason: string, force = false): Promise<void> {
     const unit = job.current;
     if (!unit) return this.pump(job.id);
-    if (!force && unit.attempt >= job.config.maxAttempts && !unit.rateLimited) return this.failUnit(job, reason);
+    const attemptBase = job.reprocessAttemptBases?.[`${unit.kind}:${unit.ref}`] ?? 0;
+    if (!force && unit.attempt - attemptBase >= job.config.maxAttempts && !unit.rateLimited) return this.failUnit(job, reason);
     const prevAttempt = Math.max(0, unit.attempt - (unit.rateLimited ? 1 : 0));
     if (unit.kind === 'index' || unit.kind === 'extract') {
       const meta = await getChunkMeta(job.id, Number(unit.ref));
@@ -1143,7 +1399,7 @@ export class Engine {
   }
 
   private async beginReduce(job: Job): Promise<void> {
-    const metas = (await chunkMetasByJob(job.id)).sort((a, b) => a.index - b.index);
+    const metas = (await chunkMetasByJob(job.id)).sort(compareChunkOrder);
     const ids = metas.filter((meta) => meta.status === 'done' && meta.resultId).map((meta) => meta.resultId!);
     if (ids.length === 0) return this.failJob(job, '没有任何提炼结果，无法归并');
     if (ids.length === 1) return this.finalize(job, ids[0]!);
@@ -1155,7 +1411,7 @@ export class Engine {
     if (job.config.taskKind === 'knowledge' && hasStructuredResults) {
       const groups = planGroups(results.map((result) => JSON.stringify(result.parsed).length), {
         fanIn: job.config.fanIn,
-        maxChars: job.config.maxChunkChars,
+        maxChars: Math.min(job.config.maxChunkChars, job.contextInputBudget ?? Infinity),
       });
       job = {
         ...job,
@@ -1174,7 +1430,7 @@ export class Engine {
       return this.dispatchNextReduce(job);
     }
     const groups = planGroups(results.map((result) => result.raw.length),
-      { fanIn: job.config.fanIn, maxChars: job.config.maxChunkChars });
+      { fanIn: job.config.fanIn, maxChars: Math.min(job.config.maxChunkChars, job.contextInputBudget ?? Infinity) });
     if (groups.length >= ids.length) return this.failJob(job, '提炼结果超过归并预算且无法收敛；请提高归并预算或缩小分块');
     job = { ...job, reduceState: { level: 1, inputIds: ids, groups, nextGroup: 0, outputIds: [] } };
     await saveJob(job);

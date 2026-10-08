@@ -8,6 +8,7 @@ import { DeepSeekProviderHost } from '../providers/deepseek/runtime';
 const provider = new DeepSeekProviderHost();
 const host: EngineHost = {
   connect: (job) => provider.connect(job),
+  getAccountIdentity: (connectionId) => provider.getAccountIdentity(connectionId),
   prepare: (connectionId, unit) => provider.prepare(connectionId, unit),
   submit: (connectionId, marker, prompt) => provider.submit(connectionId, marker, prompt),
   inspect: (connectionId, unit) => provider.inspect(connectionId, unit),
@@ -52,11 +53,11 @@ chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) =>
   if (isAdapterEvent(message) && sender.tab?.id != null) {
     const connectionId = String(sender.tab.id);
     switch (message.type) {
-      case 'ready': return respond(() => engine.onAdapterReady(connectionId), sendResponse);
+      case 'ready': return respond(() => engine.onAdapterReady(connectionId, message.accountKey, message.accountLabel), sendResponse);
       case 'generationStart': return respond(() => engine.onGenerationStart(connectionId), sendResponse);
       case 'generationEnd': return respond(() => engine.onGenerationEnd(connectionId), sendResponse);
       case 'rateLimited': return respond(
-        () => engine.onRateLimited(connectionId, message.detail ?? '', message.retryAfterMs, message.continuationRetryAfterMs),
+        () => engine.onRateLimited(connectionId, message.detail ?? '', message.retryAfterMs, message.continuationRetryAfterMs, message.accountKey, message.accountLabel),
         sendResponse,
       );
       case 'error': return respond(() => engine.onAdapterError(connectionId, message.detail ?? ''), sendResponse);

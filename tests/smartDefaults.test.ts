@@ -18,11 +18,11 @@ describe('smart defaults', () => {
     const massive = recommendJobConfig(10_000_000);
     expect(medium.maxChunkChars).toBeGreaterThan(small.maxChunkChars);
     expect(large.maxChunkChars).toBeGreaterThan(medium.maxChunkChars);
-    expect(huge.maxChunkChars).toBeGreaterThan(large.maxChunkChars);
-    expect(huge.maxChunkChars).toBeLessThanOrEqual(384_000);
-    expect(massive.maxChunkChars).toBe(512_000);
+    expect(huge.maxChunkChars).toBeGreaterThanOrEqual(large.maxChunkChars);
+    expect(huge.maxChunkChars).toBeLessThanOrEqual(64_000);
+    expect(massive.maxChunkChars).toBe(64_000);
     expect(huge.generationTimeoutMs).toBeGreaterThan(large.generationTimeoutMs);
-    expect(huge.fanIn).toBeGreaterThan(small.fanIn);
+    expect(huge.fanIn).toBeLessThanOrEqual(small.fanIn);
   });
 
   it('补齐缺省配置', () => {

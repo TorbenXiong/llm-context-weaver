@@ -6,16 +6,19 @@ export interface DeepSeekContinuationResult {
   detail?: string;
 }
 
-export type DeepSeekCommand =
-  | { channel: 'deepseek-v5'; type: 'ping' }
-  | { channel: 'deepseek-v5'; type: 'newChat' }
-  | { channel: 'deepseek-v5'; type: 'setFeatures'; deepThinking: boolean; smartSearch: boolean }
-  | { channel: 'deepseek-v5'; type: 'hasMarker'; marker: string }
-  | { channel: 'deepseek-v5'; type: 'sendPrompt'; text: string }
-  | { channel: 'deepseek-v5'; type: 'readReply'; marker: string; expectJson: boolean }
-  | { channel: 'deepseek-v5'; type: 'continueGeneration'; marker: string }
-  | { channel: 'deepseek-v5'; type: 'deleteSessions'; sessionRefs: string[] }
-  | { channel: 'deepseek-v5'; type: 'status' };
+export const DEEPSEEK_CHANNEL = 'deepseek-v8';
+
+export type DeepSeekCommand = { channel: typeof DEEPSEEK_CHANNEL } & (
+  | { type: 'ping' }
+  | { type: 'newChat' }
+  | { type: 'setFeatures'; deepThinking: boolean; smartSearch: boolean }
+  | { type: 'hasMarker'; marker: string }
+  | { type: 'sendPrompt'; text: string }
+  | { type: 'readReply'; marker: string; expectJson: boolean }
+  | { type: 'continueGeneration'; marker: string }
+  | { type: 'deleteSessions'; sessionRefs: string[] }
+  | { type: 'accountKey' }
+  | { type: 'status' });
 
 export const isDeepSeekCommand = (message: unknown): message is DeepSeekCommand =>
-  !!message && typeof message === 'object' && (message as { channel?: string }).channel === 'deepseek-v5';
+  !!message && typeof message === 'object' && (message as { channel?: string }).channel === DEEPSEEK_CHANNEL;

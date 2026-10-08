@@ -32,34 +32,25 @@ export function inferPipelineMode(taskKind: TaskKind, chunkCount: number): Pipel
 
 /**
  * 根据输入规模给出吞吐优先的起始参数。分块越多，网页会话、对账和输入/输出量冷却的
- * 固定开销越高，因此输入变大时逐步增大单块；同时保留 384k 的软上限，给提示词、
+ * 固定开销越高，因此输入变大时逐步增大单块；同时保留 64k 的软上限，给提示词、
  * 模型输出和网页生成状态留出余量。它只负责建议，不改变已保存的 JobConfig，
  * 用户仍可在高级参数中覆盖任意一项。
  */
 export function recommendJobConfig(inputChars: number): SmartDefaults {
   const size = Math.max(0, inputChars);
-  if (size >= 10_000_000) {
-    return {
-      maxChunkChars: 512_000,
-      fanIn: 16,
-      sendDelayMs: 2_000,
-      generationTimeoutMs: 15 * 60_000,
-      explanation: '10M 以上输入：采用最大吞吐分块并延长单次超时，显著减少网页会话和冷却次数。',
-    };
-  }
   if (size >= 5_000_000) {
     return {
-      maxChunkChars: 384_000,
-      fanIn: 16,
+      maxChunkChars: 64_000,
+      fanIn: 8,
       sendDelayMs: 2_000,
       generationTimeoutMs: 15 * 60_000,
-      explanation: '超大输入：采用高吞吐大分块并延长单次超时，显著减少网页会话和冷却次数。',
+      explanation: '超大输入：分块建议不超过 64k 字符，并延长单次超时，为提示和输出保留余量。',
     };
   }
   if (size >= 1_000_000) {
     return {
-      maxChunkChars: 256_000,
-      fanIn: 12,
+      maxChunkChars: 64_000,
+      fanIn: 8,
       sendDelayMs: 1_800,
       generationTimeoutMs: 12 * 60_000,
       explanation: '大输入：采用较大分块并延长单次超时，降低总会话数。',
@@ -67,8 +58,8 @@ export function recommendJobConfig(inputChars: number): SmartDefaults {
   }
   if (size >= 200_000) {
     return {
-      maxChunkChars: 96_000,
-      fanIn: 10,
+      maxChunkChars: 48_000,
+      fanIn: 8,
       sendDelayMs: 1_500,
       generationTimeoutMs: 8 * 60_000,
       explanation: '中等输入：适度增大分块，减少网页会话，同时保持单次生成可控。',

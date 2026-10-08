@@ -121,4 +121,28 @@ describe('DeepSeek provider policy', () => {
     expect(advice?.until).toBe(now - 1_000 + DEEPSEEK_MIN_DISPATCH_INTERVAL_MS);
     expect(advice?.detail).toContain('连续发送间隔不足');
   });
+
+  it('切换账号后不把旧账号流量计入主动限流', () => {
+    const now = 1_000_000;
+    const advice = getDeepSeekDispatchCooldown({
+      providerAccountKey: 'account-b',
+      trafficHistory: [{
+        marker: 'old-account',
+        accountKey: 'account-a',
+        submittedAt: now - 1_000,
+        inputChars: DEEPSEEK_PROACTIVE_MAX_TRAFFIC_CHARS,
+        outputChars: DEEPSEEK_PROACTIVE_MAX_OUTPUT_CHARS,
+      }],
+      rateLimitEvents: [{
+        accountKey: 'account-a',
+        occurredAt: now - 1_000,
+        sentCount: 1,
+        providerSessionCount: 1,
+        inputChars: DEEPSEEK_PROACTIVE_MAX_TRAFFIC_CHARS,
+        outputChars: DEEPSEEK_PROACTIVE_MAX_OUTPUT_CHARS,
+        retryAfterMs: DEEPSEEK_RATE_LIMIT_RETRY_MS,
+      }],
+    }, 1_000, now);
+    expect(advice).toBeNull();
+  });
 });
