@@ -24,6 +24,10 @@ export interface AdapterEvent {
   retryAfterMs?: number;
   /** 旧版本兼容字段；当前不会据此安排自动检查。 */
   continuationRetryAfterMs?: number;
+  /** Provider Adapter 生成的脱敏账号标识，核心不解释其内容。 */
+  accountKey?: string;
+  /** 可展示的脱敏账号名。 */
+  accountLabel?: string;
 }
 
 const hasChannel = (m: unknown, channel: string): boolean =>

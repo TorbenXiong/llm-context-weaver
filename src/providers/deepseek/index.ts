@@ -1,23 +1,26 @@
 /** Content Script 入口：注入防重，注册命令监听，上报适配器事件 */
 import type { AdapterEvent } from '../../core/messaging';
 import { DeepSeekAdapter } from './adapter';
-import { isDeepSeekCommand, type DeepSeekCommand } from './messages';
+import { DEEPSEEK_CHANNEL, isDeepSeekCommand, type DeepSeekCommand } from './messages';
 
 declare global {
   interface Window {
     __lcwDeepSeekInjected?: boolean | string;
+    __lcwDeepSeekDispose?: () => void;
   }
 }
 
 // 修改 Content Script/探针协议时必须递增。扩展 reload 不会销毁已打开页面里的
 // isolated world；版本号确保 runtime 按需注入时不会被旧防重标记拦截。
-const CONTENT_SCRIPT_VERSION = 'deepseek-v5';
+const CONTENT_SCRIPT_VERSION = DEEPSEEK_CHANNEL;
 
 if (window.__lcwDeepSeekInjected !== CONTENT_SCRIPT_VERSION) {
+  window.__lcwDeepSeekDispose?.();
   window.__lcwDeepSeekInjected = CONTENT_SCRIPT_VERSION;
   const documentToken = crypto.randomUUID();
 
   const emit = (e: AdapterEvent): void => {
+    if (window.__lcwDeepSeekInjected !== CONTENT_SCRIPT_VERSION) return;
     try {
       void chrome.runtime.sendMessage(e);
     } catch {
@@ -36,8 +39,8 @@ if (window.__lcwDeepSeekInjected !== CONTENT_SCRIPT_VERSION) {
 
   const adapter = new DeepSeekAdapter(emit);
 
-  chrome.runtime.onMessage.addListener((msg: DeepSeekCommand, _sender, sendResponse) => {
-    if (!isDeepSeekCommand(msg)) return false;
+  const listener: Parameters<typeof chrome.runtime.onMessage.addListener>[0] = (msg: DeepSeekCommand, _sender, sendResponse) => {
+    if (window.__lcwDeepSeekInjected !== CONTENT_SCRIPT_VERSION || !isDeepSeekCommand(msg)) return false;
     // 探活必须同步回复，否则文档进入 BFCache 时异步响应端口会先被关闭。
     // URL + 文档令牌用于防止导航后的旧 content script 抢答。
     if (msg.type === 'ping') {
@@ -49,8 +52,12 @@ if (window.__lcwDeepSeekInjected !== CONTENT_SCRIPT_VERSION) {
       .then(sendResponse)
       .catch((e: unknown) => sendResponse({ ok: false, error: e instanceof Error ? e.message : String(e) }));
     return true; // 异步响应
-  });
+  };
+  chrome.runtime.onMessage.addListener(listener);
+  window.__lcwDeepSeekDispose = () => {
+    chrome.runtime.onMessage.removeListener(listener);
+    adapter.dispose();
+  };
 
   adapter.start();
-  emit({ channel: 'adapter', type: 'ready' });
 }

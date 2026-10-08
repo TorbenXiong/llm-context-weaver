@@ -1,13 +1,15 @@
-import type { ProviderCleanupResult, ProviderHost, ProviderInspection, ProviderPrepareOutcome, ProviderSubmitOutcome } from '../../core/provider';
+import type { ProviderAccountIdentity, ProviderCleanupResult, ProviderHost, ProviderInspection, ProviderPrepareOutcome, ProviderSubmitOutcome } from '../../core/provider';
 import type { CurrentUnit, Job } from '../../core/types';
-import type { DeepSeekCommand, DeepSeekContinuationResult } from './messages';
+import { DEEPSEEK_CHANNEL, type DeepSeekCommand, type DeepSeekContinuationResult } from './messages';
+import { parseJsonResult } from '../../core/protocol/schema';
 import { DEEPSEEK_CONTINUATION_PROBE_MS, DEEPSEEK_RATE_LIMIT_RETRY_MS, getDeepSeekDispatchCooldown } from './policy';
+import { isDeepSeekConversationLimitText } from './contextLimit';
 
 const HOME = 'https://chat.deepseek.com/';
 const URL_PATTERN = 'https://chat.deepseek.com/*';
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 const command = <T extends Omit<DeepSeekCommand, 'channel'>>(value: T): DeepSeekCommand =>
-  ({ channel: 'deepseek-v5', ...value }) as DeepSeekCommand;
+  ({ channel: DEEPSEEK_CHANNEL, ...value }) as DeepSeekCommand;
 
 /** 忽略查询参数、hash 和尾斜杠，避免同一会话因 URL 展示差异被反复重新导航。 */
 export function isSameRemoteSession(left: string | undefined, right: string): boolean {
@@ -363,6 +365,13 @@ export class DeepSeekProviderHost implements ProviderHost {
     return getDeepSeekDispatchCooldown(job, inputChars, now);
   }
 
+  async getAccountIdentity(connectionId: string): Promise<ProviderAccountIdentity | undefined> {
+    const tabId = tabIdOf(connectionId);
+    await ensureTabReady(tabId);
+    const reply = await send(tabId, command({ type: 'accountKey' })) as ProviderAccountIdentity | null;
+    return typeof reply?.key === 'string' && reply.key ? reply : undefined;
+  }
+
   async connect(job: Job): Promise<string> {
     // legacy 是 v1 原型数据的迁移标记；当时唯一 Provider 就是 DeepSeek。
     if (job.providerId !== 'deepseek' && job.providerId !== 'legacy') {
@@ -443,6 +452,9 @@ export class DeepSeekProviderHost implements ProviderHost {
     if (reply?.outcome === 'retryable') {
       return { status: 'retryable', detail: reply.error ?? 'DeepSeek 暂时忙碌', retryAfterMs: 5_000 };
     }
+    if (reply?.outcome === 'retry_current') {
+      return { status: 'retry_current', strategy: 'split_input', detail: reply.error ?? 'DeepSeek 对话已达到长度上限，请开启新对话重试当前单元' };
+    }
     if (reply?.outcome === 'rate_limited') {
       return {
         status: 'rate_limited',
@@ -468,6 +480,7 @@ export class DeepSeekProviderHost implements ProviderHost {
       await ensureTabAvailable(tabId);
       const status = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
       if (status?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
+      if (status?.state === 'conversation_limit') return this.inspectConversationLimit(tabId, unit);
       const reply = await send(tabId, command({
         type: 'readReply',
         marker: unit.marker,
@@ -475,7 +488,9 @@ export class DeepSeekProviderHost implements ProviderHost {
       })) as { found?: boolean; text?: string; error?: string } | null;
       const latestStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
       if (latestStatus?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
+      if (latestStatus?.state === 'conversation_limit') return this.inspectConversationLimit(tabId, unit);
       if (reply?.found && typeof reply.text === 'string' && reply.text.trim()) {
+        if (isDeepSeekConversationLimitText(reply.text)) return this.inspectConversationLimit(tabId, unit);
         return { status: 'complete', reply: reply.text, remoteRef: unit.remoteRef };
       }
       if (status?.state === 'rate_limited' || latestStatus?.state === 'rate_limited') return limited;
@@ -506,6 +521,7 @@ export class DeepSeekProviderHost implements ProviderHost {
     // 先查官方通知，避免页面已经限流时仍点击“继续生成”。
     try {
       const firstStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+      if (firstStatus?.state === 'conversation_limit') return this.inspectConversationLimit(tabId, unit);
       if (firstStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
     } catch {
       // 旧脚本或导航中的页面仍沿用下面的探活与重注入流程。
@@ -523,6 +539,7 @@ export class DeepSeekProviderHost implements ProviderHost {
     }
     await waitUntilReady(tabId, unit.remoteRef ?? undefined);
     const readyStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+    if (readyStatus?.state === 'conversation_limit') return this.inspectConversationLimit(tabId, unit);
     if (readyStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
     // “继续生成”是生成达到上限后的终态控件，必须优先于普通生成状态探测。
     // DeepSeek 可能同时保留一个可见但 disabled 的主按钮；若先查 status，
@@ -538,6 +555,7 @@ export class DeepSeekProviderHost implements ProviderHost {
       }
     }
     const status = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
+    if (status?.state === 'conversation_limit') return this.inspectConversationLimit(tabId, unit);
     if (status?.state === 'rate_limited' && !unit.rateLimited) return limited;
     if (status?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
     if (status?.state !== 'idle' && !(unit.rateLimited && status?.state === 'rate_limited')) {
@@ -553,6 +571,7 @@ export class DeepSeekProviderHost implements ProviderHost {
       error?: string;
     } | null;
     if (reply?.found && typeof reply.text === 'string' && reply.text.trim()) {
+      if (isDeepSeekConversationLimitText(reply.text)) return this.inspectConversationLimit(tabId, unit);
       const continuationAfterReply = await send(tabId, command({
         type: 'continueGeneration',
         marker: unit.marker,
@@ -566,6 +585,7 @@ export class DeepSeekProviderHost implements ProviderHost {
       // 读取回复期间生成状态可能发生变化；以最新状态为准，避免把仍在生成的半成品交给核心。
       const latestStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
       if (latestStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
+      if (latestStatus?.state === 'conversation_limit') return this.inspectConversationLimit(tabId, unit);
       if (latestStatus?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
       return { status: 'complete', reply: reply.text, remoteRef: unit.remoteRef };
     }
@@ -582,9 +602,24 @@ export class DeepSeekProviderHost implements ProviderHost {
     }
     const latestStatus = await send(tabId, command({ type: 'status' })) as { state?: string } | null;
     if (latestStatus?.state === 'rate_limited' && !unit.rateLimited) return limited;
+    if (latestStatus?.state === 'conversation_limit') return this.inspectConversationLimit(tabId, unit);
     if (latestStatus?.state === 'generating') return { status: 'generating', remoteRef: unit.remoteRef };
     const marker = await send(tabId, command({ type: 'hasMarker', marker: unit.marker })) as { has?: boolean } | null;
     return { status: 'missing', detail: marker?.has ? '已找到请求 marker，但尚未找到对应回复' : '当前会话中没有请求 marker' };
+  }
+
+  private async inspectConversationLimit(tabId: number, unit: CurrentUnit): Promise<ProviderInspection> {
+    // 上限提示可能在完整回复之后出现；只收集当前 marker 的完整 JSON。
+    // 自由文本无法判断是否截断，保留原输入并走拆分/有界重试。
+    if (unit.outputFormat !== 'text') {
+      const reply = await send(tabId, command({ type: 'readReply', marker: unit.marker, expectJson: true })) as
+        { found?: boolean; text?: string } | null;
+      if (reply?.found && reply.text && parseJsonResult(reply.text)) {
+        return { status: 'complete', reply: reply.text, remoteRef: unit.remoteRef };
+      }
+    }
+    return { status: 'retry_current', strategy: 'split_input',
+      detail: 'DeepSeek 已达到对话长度上限，自动缩小输入并开启新对话重试', remoteRef: unit.remoteRef };
   }
 
   async cleanupSessions(connectionId: string, sessionRefs: readonly string[]): Promise<ProviderCleanupResult> {

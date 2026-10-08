@@ -4,6 +4,8 @@
  * 所有列表按优先级降序，queryFirst/queryAll 取第一个有命中的选择器。
  * 注意：避免使用 :has(svg rect) 这类宽匹配——lottie 动画的 clipPath 内含 rect，会误命中。
  */
+import { isDeepSeekConversationLimitText } from './contextLimit';
+
 export const INPUT_SELECTORS = [
   'textarea[placeholder*="发送"]',
   'textarea[placeholder*="DeepSeek" i]',
@@ -41,6 +43,14 @@ export const NEW_CHAT_SELECTORS = [
   'a[href="/"]',
 ];
 
+/** 侧栏账号入口的昵称节点；不要使用侧栏/按钮全页扫描，会话标题也可能含手机号。 */
+export const ACCOUNT_LABEL_SELECTORS = [
+  '._2afd28d[tabindex="0"] ._9d8da05',
+];
+
+export const ACCOUNT_EXCLUDED_REGIONS =
+  'a, [class*="scroll" i], .ds-message, .ds-markdown, main, textarea, input, [contenteditable="true"]';
+
 /** 虚拟滚动容器（长会话只渲染视口内消息，收集时需滚动加载） */
 export const SCROLL_AREA_SELECTORS = [
   '.ds-scroll-area--enabled',
@@ -73,29 +83,38 @@ export function isRateLimitNoticeText(text: string): boolean {
 }
 
 /** 发送被拒时，DeepSeek 会把错误放在最新用户消息的正文外，且不赋予 alert/toast 语义。 */
-export function findInlineRateLimitNotice(root: ParentNode = document): string | null {
+function findInlineNotice(root: ParentNode, matches: (text: string) => boolean): string | null {
   const items = root.querySelectorAll<HTMLElement>('[data-virtual-list-item-key]');
   const latest = Array.from(items).filter((item) => item.querySelector('.ds-message')).at(-1);
   if (!latest) return null;
   for (const node of latest.querySelectorAll<HTMLElement>('span, p, div')) {
-    if (node.children.length > 0 || node.closest('.ds-message') || !node.getClientRects().length) continue;
+    if (node.children.length > 0 || node.closest('.ds-message, .ds-markdown, textarea, input, [contenteditable="true"]') || !node.getClientRects().length) continue;
     const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-    if (text.length <= 160 && isRateLimitNoticeText(text)) return text;
+    if (text.length <= 500 && matches(text)) return text;
   }
   return null;
 }
 
-export function findRateLimitNotice(root: ParentNode = document): string | null {
+function findNotice(root: ParentNode, matches: (text: string) => boolean): string | null {
   for (const selector of NOTICE_SELECTORS) {
     for (const node of root.querySelectorAll<HTMLElement>(selector)) {
-      if (!node.getClientRects().length) continue;
+      if (!node.getClientRects().length || node.closest('.ds-message, .ds-markdown, textarea, input, [contenteditable="true"]')) continue;
       // 通知通常很短；长正文即使碰巧使用了相同 class，也不应当作限流。
       const text = (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim();
-      if (text.length <= 160 && isRateLimitNoticeText(text)) return text;
+      if (text.length <= 500 && matches(text)) return text;
     }
   }
-  return findInlineRateLimitNotice(root);
+  return findInlineNotice(root, matches);
 }
+
+export const findInlineRateLimitNotice = (root: ParentNode = document): string | null =>
+  findInlineNotice(root, (text) => text.length <= 160 && isRateLimitNoticeText(text));
+
+export const findRateLimitNotice = (root: ParentNode = document): string | null =>
+  findNotice(root, (text) => text.length <= 160 && isRateLimitNoticeText(text));
+
+export const findConversationLimitNotice = (root: ParentNode = document): string | null =>
+  findNotice(root, isDeepSeekConversationLimitText);
 
 export function queryFirst(selectors: string[], root: ParentNode = document): Element | null {
   for (const s of selectors) {

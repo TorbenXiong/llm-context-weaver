@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
+  DeepSeekProviderHost,
   isDeepSeekHome,
   isDeepSeekRemoteSessionMissingError,
   isReadyPingReply,
@@ -11,6 +12,43 @@ import {
   shouldTryContinuationFallback,
 } from '../src/providers/deepseek/runtime';
 import type { CurrentUnit } from '../src/core/types';
+import type { DeepSeekCommand } from '../src/providers/deepseek/messages';
+
+describe('DeepSeek 上下文超限对账', () => {
+  afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+
+  it.each([false, true])('优先收集当前 marker 的完整 JSON，manual=%s', async (manualIntervention) => {
+    vi.useFakeTimers();
+    const remoteRef = 'https://chat.deepseek.com/a/chat/s/test';
+    const raw = '{"knowledge":[{"category":"事实","topic":"错误提示","content":"达到对话长度上限，请开启新对话"}]}';
+    const sendMessage = vi.fn(async (_id: number, message: DeepSeekCommand) => {
+      if (message.type === 'ping') return { ok: true, url: remoteRef, documentToken: 'current-document' };
+      if (message.type === 'status') return { state: 'conversation_limit' };
+      if (message.type === 'readReply') return { found: true, text: raw };
+      throw new Error(`不应执行 ${message.type}`);
+    });
+    const executeScript = vi.fn();
+    vi.stubGlobal('chrome', { tabs: { get: async () => ({ url: remoteRef, autoDiscardable: false }), sendMessage }, scripting: { executeScript } });
+    const inspection = new DeepSeekProviderHost().inspect('1', {
+      kind: 'extract', ref: '0', attempt: 1, marker: '[LCW current]', phase: 'acknowledged',
+      outputFormat: 'knowledge-json', remoteRef, manualIntervention,
+    });
+    await vi.runAllTimersAsync();
+    expect(await inspection).toMatchObject({ status: 'complete', reply: raw });
+    expect(sendMessage.mock.calls.find(([, message]) => message.type === 'readReply')?.[1]).toMatchObject({ marker: '[LCW current]' });
+    expect(executeScript).not.toHaveBeenCalled();
+  });
+
+  it.each(['knowledge-json', 'text'] as const)('超限时不会把半截 %s 当作完整结果', async (outputFormat) => {
+    const sendMessage = vi.fn(async (_id: number, message: DeepSeekCommand) => message.type === 'status'
+      ? { state: 'conversation_limit' } : { found: true, text: '{"knowledge":[' });
+    vi.stubGlobal('chrome', { tabs: { get: async () => ({ autoDiscardable: false }), sendMessage } });
+    expect(await new DeepSeekProviderHost().inspect('1', {
+      kind: 'extract', ref: '0', attempt: 1, marker: '[LCW current]', phase: 'acknowledged',
+      manualIntervention: true, outputFormat,
+    })).toMatchObject({ status: 'retry_current', strategy: 'split_input' });
+  });
+});
 
 describe('DeepSeek remote session URL', () => {
   it('查询参数、hash 和尾斜杠不同仍视为同一会话', () => {

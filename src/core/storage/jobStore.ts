@@ -12,6 +12,9 @@ const normalizeJob = (job: Job): Job => ({
   ...job,
   config: normalizeJobConfig(job.config),
   providerSessionRefs: Array.isArray(job.providerSessionRefs) ? job.providerSessionRefs : [],
+  providerRateLimits: Array.isArray(job.providerRateLimits)
+    ? job.providerRateLimits.filter((entry) => entry && typeof entry.accountKey === 'string' && typeof entry.limitedUntil === 'number')
+    : [],
   trafficHistory: Array.isArray(job.trafficHistory) ? job.trafficHistory : [],
   rateLimitEvents: (() => {
     if (!Array.isArray(job.rateLimitEvents)) return [];
@@ -76,9 +79,12 @@ export async function createJob(name: string, config: JobConfig, providerId: str
     providerId,
     providerConnectionId: null,
     providerSessionRefs: [],
+    providerRateLimits: [],
+    providerAccountKey: undefined,
     sessionCooldownUntil: undefined,
     sessionCooldownStartedAt: undefined,
     sessionCooldownReason: undefined,
+    sessionCooldownAccountKey: undefined,
     trafficHistory: [],
     rateLimitEvents: [],
     eventLog: [],
@@ -173,6 +179,82 @@ export async function appendChunks(jobId: string, startIndex: number, texts: str
   });
 }
 
+/**
+ * Provider 报告会话上下文超限时，把当前原文分成多个独立分块。
+ * 原分块复用编号，新编号追加分配；sourceOrder 保留原文顺序，不改写历史结果引用。
+ */
+export async function splitChunkForContextLimit(jobId: string, marker: string, texts: string[], detail: string): Promise<Job | undefined> {
+  const parts = texts.filter((text) => text.length > 0);
+  if (parts.length < 2) return undefined;
+  const db = await openDb();
+  return new Promise<Job | undefined>((resolve, reject) => {
+    const t = db.transaction(['jobs', 'chunks', 'chunkTexts'], 'readwrite');
+    const jobs = t.objectStore('jobs');
+    const chunks = t.objectStore('chunks');
+    const bodies = t.objectStore('chunkTexts');
+    const jobReq = jobs.get(jobId);
+    let updated: Job | undefined;
+    let job: Job | undefined;
+    let original: ChunkMeta | undefined;
+    t.oncomplete = () => resolve(updated);
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error);
+    // 元数据读取和全部写入在同一事务中完成，避免半拆分状态。
+    const ready = () => {
+      if (!job || !original || job.current?.marker !== marker || original.jobId !== jobId) return;
+      const index = original.index;
+      const order = original.sourceOrder ?? [index];
+      const nextIndex = job.totalChunks;
+      const reset: ChunkMeta = {
+        ...original,
+        status: 'pending',
+        attempts: 0,
+        sourceOrder: [...order, 0],
+        stage: job.config.pipelineMode === 'staged' ? 'index' : 'process',
+        indexResultId: null,
+        resultId: null,
+        error: null,
+      };
+      const firstId = chunkId(jobId, index);
+      chunks.put(reset);
+      bodies.put({ id: firstId, text: parts[0]! } satisfies ChunkText);
+      for (let offset = 1; offset < parts.length; offset++) {
+        const partIndex = nextIndex + offset - 1;
+        const id = chunkId(jobId, partIndex);
+        const meta: ChunkMeta = {
+          ...original,
+          id,
+          index: partIndex,
+          status: 'pending',
+          attempts: 0,
+          sourceOrder: [...order, offset],
+          stage: reset.stage,
+          indexResultId: null,
+          resultId: null,
+          error: null,
+        };
+        chunks.put(meta);
+        bodies.put({ id, text: parts[offset]! } satisfies ChunkText);
+      }
+      // 清除在途请求和新增分块同事务提交；重启后不会再发送拆分前的正文。
+      updated = appendJobEvent({ ...job, current: null, lastError: detail,
+        reprocessAttemptBases: { ...job.reprocessAttemptBases,
+          [`index:${index}`]: Math.max(job.current.attempt, job.reprocessAttemptBases?.[`index:${index}`] ?? 0),
+          [`extract:${index}`]: Math.max(job.current.attempt, job.reprocessAttemptBases?.[`extract:${index}`] ?? 0),
+        },
+        totalChunks: nextIndex + parts.length - 1, updatedAt: Date.now(),
+      }, 'context-split', `${job.current.kind}/${index} 上下文超限，已拆分为 ${parts.length} 个分块后继续`);
+      jobs.put(updated);
+    };
+    jobReq.onsuccess = () => {
+      job = jobReq.result as Job | undefined;
+      if (!job?.current || job.current.marker !== marker || !['index', 'extract'].includes(job.current.kind)) return;
+      const metaReq = chunks.get(chunkId(jobId, Number(job.current.ref)));
+      metaReq.onsuccess = () => { original = metaReq.result as ChunkMeta | undefined; ready(); };
+    };
+  });
+}
+
 /** 在已持久化的 current 上记录 Provider 已观察到提交确认。 */
 export async function markUnitSubmitted(
   jobId: string,
@@ -202,6 +284,7 @@ export async function markUnitSubmitted(
         ? (Array.isArray(job.trafficHistory) ? job.trafficHistory : [])
         : [...(Array.isArray(job.trafficHistory) ? job.trafficHistory : []), {
           marker,
+          accountKey: job.current.submissionAccountKey ?? job.providerAccountKey,
           submittedAt: now,
           inputChars: Math.max(0, job.current.inputChars ?? 0),
         } satisfies TrafficSample].slice(-TRAFFIC_HISTORY_LIMIT);
@@ -276,9 +359,13 @@ export async function commitIndexed(
         output = withOutputTraffic(appendJobEvent({
           ...job,
           current: null,
+          providerRateLimits: recoveredFromRateLimit && trafficUnit.rateLimitAccountKey
+            ? (job.providerRateLimits ?? []).filter((entry) => entry.accountKey !== trafficUnit.rateLimitAccountKey)
+            : job.providerRateLimits,
           sessionCooldownUntil: recoveredFromRateLimit ? undefined : job.sessionCooldownUntil,
           sessionCooldownStartedAt: recoveredFromRateLimit ? undefined : job.sessionCooldownStartedAt,
           sessionCooldownReason: recoveredFromRateLimit ? undefined : job.sessionCooldownReason,
+          sessionCooldownAccountKey: recoveredFromRateLimit ? undefined : job.sessionCooldownAccountKey,
           status: job.status === 'paused' ? 'paused' : 'processing',
           prevStatus: job.status === 'paused' ? 'processing' : job.prevStatus,
           lastError: null,
@@ -340,9 +427,13 @@ export async function commitCollected(
         output = withOutputTraffic(appendJobEvent({
           ...job,
           current: null,
+          providerRateLimits: recoveredFromRateLimit && trafficUnit.rateLimitAccountKey
+            ? (job.providerRateLimits ?? []).filter((entry) => entry.accountKey !== trafficUnit.rateLimitAccountKey)
+            : job.providerRateLimits,
           sessionCooldownUntil: recoveredFromRateLimit ? undefined : job.sessionCooldownUntil,
           sessionCooldownStartedAt: recoveredFromRateLimit ? undefined : job.sessionCooldownStartedAt,
           sessionCooldownReason: recoveredFromRateLimit ? undefined : job.sessionCooldownReason,
+          sessionCooldownAccountKey: recoveredFromRateLimit ? undefined : job.sessionCooldownAccountKey,
           status: job.status === 'paused' ? 'paused' : nextStatus,
           prevStatus: job.status === 'paused' ? nextStatus : job.prevStatus,
           reduceState: reduceState === undefined ? job.reduceState : reduceState,
@@ -423,11 +514,20 @@ export const getChunkTextById = async (id: string): Promise<string | undefined> 
 
 export const chunkMetasByJob = (jobId: string): Promise<ChunkMeta[]> => idb.byIndex<ChunkMeta>('chunks', 'byJob', jobId);
 
+export function compareChunkOrder(left: ChunkMeta, right: ChunkMeta): number {
+  const a = left.sourceOrder ?? [left.index];
+  const b = right.sourceOrder ?? [right.index];
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return a[i]! - b[i]!;
+  }
+  return a.length - b.length;
+}
+
 export async function nextPendingChunk(jobId: string): Promise<ChunkMeta | null> {
   const metas = await chunkMetasByJob(jobId);
   let best: ChunkMeta | null = null;
   for (const m of metas) {
-    if (m.status === 'pending' && (best === null || m.index < best.index)) best = m;
+    if (m.status === 'pending' && (best === null || compareChunkOrder(m, best) < 0)) best = m;
   }
   return best;
 }

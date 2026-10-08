@@ -99,6 +99,8 @@ export interface CurrentUnit {
   manualIntervention?: boolean;
   /** 限流退避截止时间；用于 Service Worker 重启后避免提前重试。 */
   retryAfterAt?: number;
+  /** 触发本次官方限流的 Provider 账号不透明标识。 */
+  rateLimitAccountKey?: string;
   /** 旧版本字段，仅为恢复旧任务保留；当前不再自动生成检查。 */
   continuationProbeAt?: number;
   /** 深度思考任务首次观察到完整回复的时间；稳定窗口结束后才收集。 */
@@ -107,11 +109,15 @@ export interface CurrentUnit {
   remoteRef?: string | null;
   /** 本次待发送提示的字符数，用于 Provider 自己的输入量限流策略。 */
   inputChars?: number;
+  /** 提交开始时的账号，恢复确认时不能归到后来切换的账号。 */
+  submissionAccountKey?: string;
 }
 
 /** 已确认提交的输入量与回复量；核心只做遥测持久化，Provider 决定如何解释。 */
 export interface TrafficSample {
   marker: string;
+  /** 提交时所用 Provider 账号的不透明标识。 */
+  accountKey?: string;
   submittedAt: number;
   inputChars: number;
   outputChars?: number;
@@ -128,6 +134,8 @@ export interface JobEvent {
 
 /** 官方限流事件的可审计摘要，不保存提示词或回复正文。 */
 export interface RateLimitEvent {
+  /** Provider 账号的不透明标识；旧记录可能缺失。 */
+  accountKey?: string;
   occurredAt: number;
   sentCount: number;
   providerSessionCount: number;
@@ -144,6 +152,19 @@ export interface RateLimitEvent {
   outputChars: number;
   retryAfterMs: number;
   detail?: string;
+}
+
+/** 按 Provider 账号保存的限流状态；账号标识由 Adapter 生成，核心不解释。 */
+export interface ProviderRateLimitEntry {
+  providerId: string;
+  accountKey: string;
+  /** 旧记录缺失时视为官方限流。 */
+  kind?: 'official' | 'proactive';
+  /** Provider 提供的可展示脱敏账号名，例如遮盖后的手机号。 */
+  accountLabel?: string;
+  limitedUntil: number;
+  occurredAt: number;
+  reason?: string;
 }
 
 export interface ReduceGroup {
@@ -193,6 +214,16 @@ export interface Job {
   sessionCooldownStartedAt?: number;
   /** 主动冷却原因，便于工作台解释为什么暂停。 */
   sessionCooldownReason?: string;
+  /** 主动冷却所属账号；旧任务缺失时由恢复逻辑迁移。 */
+  sessionCooldownAccountKey?: string;
+  /** 官方/主动限流列表按账号隔离；切换到不在列表中的账号即可继续。 */
+  providerRateLimits?: ProviderRateLimitEntry[];
+  /** 最近一次从 Provider Adapter 观察到的账号不透明标识。 */
+  providerAccountKey?: string;
+  /** 当前账号的脱敏展示名；不得存储原始手机号或邮箱。 */
+  providerAccountLabel?: string;
+  /** 最近一次切换已识别账号的时间；只重置展示的本轮统计，不清空滚动预算。 */
+  providerAccountChangedAt?: number;
   /** 最近已确认提交的输入/输出量摘要，Provider 可据此做滚动窗口限流。 */
   trafficHistory?: TrafficSample[];
   /** 最近官方限流事件摘要，供后续任务校准主动节流。 */
@@ -206,6 +237,8 @@ export interface Job {
   formatPlanResultId?: string | null;
   /** 重跑后的 attempt 下限，避免历史结果 ID 与新会话冲突。 */
   reprocessAttemptBases?: Record<string, number>;
+  /** 上下文超限后学习到的归并正文预算，后续层沿用，避免重新组成超大输入。 */
+  contextInputBudget?: number;
   totalChunks: number;
   failedChunks: number[];
   finalResultId: string | null;
@@ -218,6 +251,8 @@ export interface ChunkMeta {
   id: string;
   jobId: string;
   index: number;
+  /** 拆分路径保留原文顺序；未拆分的旧记录以 [index] 排序。 */
+  sourceOrder?: number[];
   status: ChunkStatus;
   attempts: number;
   /** 当前分块所处流程阶段；旧任务缺失时由引擎按配置迁移。 */

@@ -4,6 +4,8 @@ export type ProviderSubmitOutcome =
   | { status: 'accepted'; remoteRef?: string | null }
   | { status: 'rejected'; detail: string }
   | { status: 'retryable'; detail: string; retryAfterMs: number }
+  /** Provider 已明确要求在新会话中重试当前单元；核心仍受 maxAttempts 约束。 */
+  | { status: 'retry_current'; detail: string; strategy?: 'new_session' | 'split_input' }
   | { status: 'ambiguous'; detail: string }
   | { status: 'rate_limited'; detail: string; retryAfterMs: number; continuationRetryAfterMs?: number };
 
@@ -14,7 +16,7 @@ export type ProviderInspection =
   | { status: 'unavailable'; detail: string; retryAfterMs: number; remoteRef?: string | null }
   | { status: 'rate_limited'; detail: string; retryAfterMs: number; continuationRetryAfterMs?: number; remoteRef?: string | null }
   /** Provider 判断当前回复已损坏或远端单元不可继续，核心应创建新会话重发。 */
-  | { status: 'retry_current'; detail: string; remoteRef?: string | null };
+  | { status: 'retry_current'; detail: string; remoteRef?: string | null; strategy?: 'new_session' | 'split_input' };
 
 export interface ProviderCleanupResult {
   deletedRefs: string[];
@@ -28,10 +30,16 @@ export interface ProviderDispatchCooldown {
   detail: string;
 }
 
+/** Adapter 提供的账号身份；key 用于隔离配额，label 仅用于脱敏展示。 */
+export interface ProviderAccountIdentity {
+  key: string;
+  label?: string;
+}
+
 export type ProviderPrepareOutcome =
   | { status: 'ready' }
   /** Provider 已确认当前远端单元不可继续，核心可以在新会话中递增 attempt 重发。 */
-  | { status: 'retry_current'; detail: string };
+  | { status: 'retry_current'; detail: string; strategy?: 'new_session' | 'split_input' };
 
 /**
  * Provider 无关的浏览器边界。连接 ID 与远端引用对核心都不透明；
@@ -39,6 +47,8 @@ export type ProviderPrepareOutcome =
  */
 export interface ProviderHost {
   connect(job: Job): Promise<string>;
+  /** 返回当前连接对应的 Provider 账号身份；未知时可返回 undefined。 */
+  getAccountIdentity?(connectionId: string): Promise<ProviderAccountIdentity | undefined>;
   prepare(connectionId: string, unit: CurrentUnit): Promise<ProviderPrepareOutcome | void>;
   submit(connectionId: string, marker: string, prompt: string): Promise<ProviderSubmitOutcome>;
   inspect(connectionId: string, unit: CurrentUnit): Promise<ProviderInspection>;
